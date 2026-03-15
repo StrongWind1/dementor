@@ -496,7 +496,11 @@ def smb2_tree_connect(handler: "SMBHandler", packet: smb2.SMB2Packet) -> None:
         req = smb2.SMB2TreeConnect(data=packet["Data"])
         path_bytes: bytes = req["Buffer"][: req["PathLength"]]
         path = path_bytes.decode("utf-16-le", errors="replace")
-        handler.log_client(f"Tree connect: {path}", "SMB2_TREE_CONNECT")
+        # G12: tree connect path — verbose per CLIENT_EXTRACTION.md
+        handler.logger.display(
+            f"<SMB2_TREE_CONNECT> Tree connect: {path}",
+            is_client=True,
+        )
     except Exception:
         handler.log_client("Tree connect (malformed)", "SMB2_TREE_CONNECT")
 
@@ -784,9 +788,11 @@ def smb1_session_setup_basic(
         setup_data["PrimaryDomain"].decode(encoding, errors="replace").rstrip("\x00")
     )
 
-    handler.log_client(
-        f"account={account!r} domain={domain!r} oem_len={oem_len} uni_len={uni_len}",
-        "SMB_COM_SESSION_SETUP_ANDX",
+    # G12: account/domain — verbose per CLIENT_EXTRACTION.md
+    handler.logger.display(
+        f"<SMB_COM_SESSION_SETUP_ANDX> account={account!r} "
+        f"domain={domain!r} oem_len={oem_len} uni_len={uni_len}",
+        is_client=True,
     )
 
     # G12: extract client NativeOS and NativeLanMan
@@ -856,6 +862,10 @@ def smb1_session_setup_basic(
         )
     # else: anonymous — skip capture
 
+    # G6: allocate Uid for basic-security path — [MS-SMB] §3.3.5.3
+    if handler.smb1_uid == 0:
+        handler.smb1_uid = secrets.randbelow(0xFFFE) + 1
+
     # Build response — [MS-CIFS] §2.2.4.53.2 (WordCount=3)
     resp_params = smb.SMBSessionSetupAndXResponse_Parameters()
     resp_data = smb.SMBSessionSetupAndXResponse_Data(flags=packet["Flags2"])
@@ -885,7 +895,8 @@ def smb1_tree_connect(handler: "SMBHandler", packet: smb.NewSMBPacket) -> None:
     """
     try:
         cmd = smb.SMBCommand(packet["Data"][0])
-        tc_data = smb.SMBTreeConnectAndXResponse_Data(flags=packet["Flags2"])
+        # [MS-CIFS] §2.2.4.55.1 — parse request data for Path field
+        tc_data = smb.SMBTreeConnectAndX_Data(flags=packet["Flags2"])
         tc_data.fromString(cmd["Data"])
         path = (
             tc_data["Path"]
@@ -895,7 +906,11 @@ def smb1_tree_connect(handler: "SMBHandler", packet: smb.NewSMBPacket) -> None:
             )
             .rstrip("\x00")
         )
-        handler.log_client(f"Tree connect: {path}", "SMB_COM_TREE_CONNECT_ANDX")
+        # G12: tree connect path — verbose per CLIENT_EXTRACTION.md
+        handler.logger.display(
+            f"<SMB_COM_TREE_CONNECT_ANDX> Tree connect: {path}",
+            is_client=True,
+        )
     except Exception:
         handler.log_client("Tree connect (malformed)", "SMB_COM_TREE_CONNECT_ANDX")
 
@@ -1090,7 +1105,8 @@ class SMBHandler(BaseProtoHandler):
                     calling_name = field.m2i(None, b"\x20" + caller[:-2]).decode(
                         errors="replace"
                     )
-                    self.logger.debug(
+                    # G12: CallingName is verbose per CLIENT_EXTRACTION.md
+                    self.logger.display(
                         f"<NETBIOS_SESSION_REQUEST> {calling_name} -> {called_name}",
                         is_client=True,
                     )
