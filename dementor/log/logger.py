@@ -274,6 +274,10 @@ class ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
         port = self.get_port(kwargs) or "<no-port>"
         colour = self.get_protocol_color(kwargs)
 
+        # Pop keys that are meaningful only to the logger, not to Rich Console.
+        kwargs.pop("is_client", False)
+        kwargs.pop("is_server", False)
+
         formatted = f"{ts_prefix}[bold {colour}]{proto:<10}[/] {host:<25} {port:<6} {msg}"
         return formatted, kwargs
 

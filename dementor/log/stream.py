@@ -357,7 +357,7 @@ class HashStreams(LoggingFileStream[HashesStreamConfig]):
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     dm_streams[f"HASH_{hash_type}"] = LoggingFileStream(
                         path=target_path,
-                        config=TomlConfig(),
+                        config=self.config,
                     )
                 write_to(f"HASH_{hash_type}", str(hash_value))
 
