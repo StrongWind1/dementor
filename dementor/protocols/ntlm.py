@@ -1228,6 +1228,11 @@ def _log_ntlmv2_blob_info(
         # Resp(1) + HiResp(1) + Reserved1(2) + Reserved2(4) + TimeStamp(8)
         #   + ChallengeFromClient(8) + Reserved3(4) = 28 bytes
         # AV_PAIRs start at offset 28 in the blob.
+
+        # ClientChallenge — 8-byte client nonce at blob[16:24]
+        client_challenge = blob[16:24]
+        log.debug(f"NTLMv2 ClientChallenge: {client_challenge.hex()}")
+
         av_data = blob[28:]
         if not av_data:
             return
