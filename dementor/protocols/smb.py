@@ -53,6 +53,7 @@ from dementor.loader import BaseProtocolModule, DEFAULT_ATTR
 from dementor.log.logger import ProtocolLogger, dm_logger
 from dementor.protocols.ntlm import (
     NTLM_AUTH_CreateChallenge,
+    NTLM_AUTH_format_host,
     NTLM_TRANSPORT_CLEARTEXT,
     NTLM_TRANSPORT_RAW,
     NTLM_new_timestamp,
@@ -413,6 +414,20 @@ def smb2_negotiate_protocol(handler: "SMBHandler", packet: smb2.SMB2Packet) -> N
         "SMB2_NEGOTIATE",
     )
 
+    # G12: client info extraction — [MS-SMB2] §2.2.3
+    try:
+        sec_mode: int = req["SecurityMode"]
+        client_caps: int = req["Capabilities"]
+        handler.logger.debug(
+            f"<SMB2_NEGOTIATE> Client SecurityMode=0x{sec_mode:04x} "
+            f"Capabilities=0x{client_caps:08x}",
+            is_client=True,
+        )
+    except Exception:
+        handler.logger.debug(
+            "Failed to extract SMB2 negotiate client info", exc_info=True
+        )
+
     # Select greatest common dialect within configured min/max range
     cfg = handler.smb_config
     dialect = max(
@@ -438,6 +453,19 @@ def smb2_negotiate_protocol(handler: "SMBHandler", packet: smb2.SMB2Packet) -> N
 
 def smb2_session_setup(handler: "SMBHandler", packet: smb2.SMB2Packet) -> None:
     req = smb2.SMB2SessionSetup(data=packet["Data"])
+
+    # G12: log PreviousSessionId — nonzero indicates reconnection
+    try:
+        prev_session: int = req["PreviousSessionId"]
+        if prev_session:
+            handler.logger.display(
+                f"<SMB2_SESSION_SETUP> Reconnecting "
+                f"(PreviousSessionId=0x{prev_session:016x})",
+                is_client=True,
+            )
+    except Exception:
+        handler.logger.debug("Failed to extract PreviousSessionId", exc_info=True)
+
     command = smb2.SMB2SessionSetup_Response()
 
     resp_token, error_code = handler.authenticate(
@@ -670,6 +698,35 @@ def smb1_session_setup(handler: "SMBHandler", packet: smb.NewSMBPacket) -> None:
         setup_data["SecurityBlobLength"] = setup_params["SecurityBlobLength"]
         setup_data.fromString(command["Data"])
 
+        # G12: extract client NativeOS and NativeLanMan
+        try:
+            client_os = (
+                setup_data["NativeOS"]
+                .decode(
+                    "utf-16-le" if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE else "ascii",
+                    errors="replace",
+                )
+                .rstrip("\x00")
+            )
+            client_lanman = (
+                setup_data["NativeLanMan"]
+                .decode(
+                    "utf-16-le" if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE else "ascii",
+                    errors="replace",
+                )
+                .rstrip("\x00")
+            )
+            if client_os or client_lanman:
+                handler.logger.display(
+                    f"<SMB_COM_SESSION_SETUP_ANDX> Client OS: {client_os!r} "
+                    f"LanMan: {client_lanman!r}",
+                    is_client=True,
+                )
+        except Exception:
+            handler.logger.debug(
+                "Failed to extract SMB1 session setup client info", exc_info=True
+            )
+
         resp_token, error_code = handler.authenticate(
             setup_data["SecurityBlob"],
             command_name="SMB_COM_SESSION_SETUP_ANDX",
@@ -717,37 +774,50 @@ def smb1_session_setup_basic(
     """
     cfg = handler.smb_config
     setup_params = smb.SMBSessionSetupAndX_Parameters(command["Parameters"])
-    setup_data = smb.SMBSessionSetupAndXResponse_Data(flags=packet["Flags2"])
+    # [MS-CIFS] §2.2.4.53.1 — request data (not response)
+    setup_data = smb.SMBSessionSetupAndX_Data()
+    setup_data["AnsiPwdLength"] = setup_params["AnsiPwdLength"]
+    setup_data["UnicodePwdLength"] = setup_params["UnicodePwdLength"]
     setup_data.fromString(command["Data"])
 
     oem_len: int = setup_params["AnsiPwdLength"]
     uni_len: int = setup_params["UnicodePwdLength"]
+    is_unicode = bool(packet["Flags2"] & smb.SMB.FLAGS2_UNICODE)
+    encoding = "utf-16-le" if is_unicode else "ascii"
 
     # Extract raw credential fields
     oem_pwd: bytes = setup_data["AnsiPwd"][:oem_len] if oem_len else b""
     uni_pwd: bytes = setup_data["UnicodePwd"][:uni_len] if uni_len else b""
 
-    account: str = (
-        setup_data["Account"]
-        .decode(
-            "utf-16-le" if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE else "ascii",
-            errors="replace",
-        )
-        .rstrip("\x00")
-    )
+    account: str = setup_data["Account"].decode(encoding, errors="replace").rstrip("\x00")
     domain: str = (
-        setup_data["PrimaryDomain"]
-        .decode(
-            "utf-16-le" if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE else "ascii",
-            errors="replace",
-        )
-        .rstrip("\x00")
+        setup_data["PrimaryDomain"].decode(encoding, errors="replace").rstrip("\x00")
     )
 
     handler.log_client(
         f"account={account!r} domain={domain!r} oem_len={oem_len} uni_len={uni_len}",
         "SMB_COM_SESSION_SETUP_ANDX",
     )
+
+    # G12: extract client NativeOS and NativeLanMan
+    try:
+        client_os = (
+            setup_data["NativeOS"].decode(encoding, errors="replace").rstrip("\x00")
+        )
+        client_lanman = (
+            setup_data["NativeLanMan"].decode(encoding, errors="replace").rstrip("\x00")
+        )
+        if client_os or client_lanman:
+            handler.logger.display(
+                f"<SMB_COM_SESSION_SETUP_ANDX> Client OS: {client_os!r} "
+                f"LanMan: {client_lanman!r}",
+                is_client=True,
+            )
+    except Exception:
+        handler.logger.debug(
+            "Failed to extract SMB1 basic session setup client info",
+            exc_info=True,
+        )
 
     # Determine transport type — cleartext vs challenge/response
     if not handler.smb1_negotiate_encrypt:
@@ -1168,6 +1238,24 @@ class SMBHandler(BaseProtoHandler):
                 if not is_gssapi:
                     self.log_client("NTLMSSP_NEGOTIATE_MESSAGE", command_name)
 
+                # G12: extract client info from NEGOTIATE_MESSAGE
+                try:
+                    client_info = NTLM_AUTH_format_host(negotiate)
+                    self.logger.display(
+                        f"<{command_name}> NTLMSSP client: {client_info}",
+                        is_client=True,
+                    )
+                    client_flags: int = negotiate["flags"]
+                    self.logger.debug(
+                        f"<{command_name}> NTLMSSP NegotiateFlags: 0x{client_flags:08x}",
+                        is_client=True,
+                    )
+                except Exception:
+                    self.logger.debug(
+                        "Failed to extract NTLMSSP negotiate client info",
+                        exc_info=True,
+                    )
+
                 # Resolve NTLM identity: NTLM overrides → SMB defaults
                 nb_computer = cfg.ntlm_nb_computer or cfg.smb_nb_computer
                 nb_domain = cfg.ntlm_nb_domain or cfg.smb_nb_domain
@@ -1217,6 +1305,19 @@ class SMBHandler(BaseProtoHandler):
                 authenticate.fromString(token)
                 if not is_gssapi:
                     self.log_client("NTLMSSP_AUTHENTICATE_MESSAGE", command_name)
+
+                # G12: log final negotiated flags (debug)
+                try:
+                    auth_flags: int = authenticate["flags"]
+                    self.logger.debug(
+                        f"<{command_name}> NTLMSSP final flags: 0x{auth_flags:08x}",
+                        is_client=True,
+                    )
+                except Exception:
+                    self.logger.debug(
+                        "Failed to extract NTLMSSP auth flags",
+                        exc_info=True,
+                    )
 
                 NTLM_report_auth(
                     authenticate,
