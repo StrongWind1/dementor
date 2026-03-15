@@ -264,7 +264,7 @@ EnableSMB1 = true
 EnableSMB2 = true
 
 # Allow SMB1→SMB2 protocol transition when clients offer SMB2 dialect strings
-# ("SMB 2.???", "SMB 2.002") in an SMB1 NEGOTIATE. Replaces old "SMB2Support".
+# ("SMB 2.???", "SMB 2.002") in an SMB1 NEGOTIATE.
 # The default value is: true
 
 AllowSMB1Upgrade = true
