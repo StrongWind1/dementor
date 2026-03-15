@@ -141,7 +141,14 @@ class SMB2SigningCapabilities(struct_factory.mixin):  # type: ignore[unsupported
 
 # --- Config ------------------------------------------------------------------
 def parse_dialect(value: str | int) -> int:
-    """Convert a dialect string (e.g. "3.1.1") to its hex constant."""
+    """Convert a dialect string (e.g. "3.1.1") to its hex constant.
+
+    :param value: Dialect version as a string (e.g. "3.1.1") or integer hex constant
+    :type value: str | int
+    :raises ValueError: If the string is not a recognized SMB2 dialect
+    :return: The SMB2 dialect hex constant
+    :rtype: int
+    """
     if isinstance(value, int):
         return value
     key = str(value).strip()
@@ -213,10 +220,23 @@ class SMBServerConfig(TomlConfig):
 
     @property
     def effective_native_lanman(self) -> str:
-        """NativeLanMan defaults to ServerOS when not explicitly set."""
+        """NativeLanMan defaults to ServerOS when not explicitly set.
+
+        :return: The effective NativeLanMan string for SMB negotiate responses
+        :rtype: str
+        """
         return self.smb_native_lanman or self.smb_server_os
 
     def set_smb_error_code(self, value: str | int) -> None:
+        """Set the SMB error code from an integer or nt_errors attribute name.
+
+        Falls back to STATUS_SMB_BAD_UID if the string does not match any
+        known nt_errors constant.
+
+        :param value: NTSTATUS code as an integer or attribute name string
+            (e.g. "STATUS_ACCESS_DENIED")
+        :type value: str | int
+        """
         if isinstance(value, int):
             self.smb_error_code = value
         else:
@@ -254,12 +274,27 @@ class SMB(BaseProtocolModule[SMBServerConfig]):
 
 # --- Utilities ---------------------------------------------------------------
 def get_server_time() -> int:
-    """Return current UTC time as a Windows FILETIME for SMB timestamps."""
+    """Return current UTC time as a Windows FILETIME for SMB timestamps.
+
+    :return: Current UTC time encoded as a 64-bit Windows FILETIME value
+    :rtype: int
+    """
     return NTLM_new_timestamp()
 
 
 def get_command_name(command: int, smb_version: int) -> str:
-    """Map an SMB command opcode to its human-readable name."""
+    """Map an SMB command opcode to its human-readable name.
+
+    Searches the ``smb.SMB`` constants (for SMBv1) or ``smb2`` module
+    constants (for SMBv2) to find the symbolic name matching the opcode.
+
+    :param command: The SMB command opcode to look up
+    :type command: int
+    :param smb_version: SMB protocol version (``0x01`` for SMB1, ``0x02`` for SMB2)
+    :type smb_version: int
+    :return: The symbolic command name (e.g. "SMB_COM_NEGOTIATE"), or "Unknown"
+    :rtype: str
+    """
     match smb_version:
         case 0x01:
             for key, value in vars(smb.SMB).items():
@@ -292,6 +327,23 @@ class SMBHandler(BaseProtoHandler):
         client_address: tuple[str, int],
         server: typing.Any,
     ) -> None:
+        """Initialize the SMB protocol handler for a single client connection.
+
+        Sets up per-connection state including SMB1/SMB2 session tracking,
+        authentication counters, and command dispatch tables. Delegates to
+        :class:`BaseProtoHandler` for transport setup.
+
+        :param config: The active session configuration
+        :type config: SessionConfig
+        :param server_config: SMB-specific server configuration from TOML
+        :type server_config: SMBServerConfig
+        :param request: The raw socket/request object from the TCP server
+        :type request: typing.Any
+        :param client_address: The ``(host, port)`` tuple of the connecting client
+        :type client_address: tuple[str, int]
+        :param server: The parent :class:`SMBServer` instance
+        :type server: typing.Any
+        """
         self.authenticated = False
         self.smb_config = server_config
 
@@ -329,6 +381,11 @@ class SMBHandler(BaseProtoHandler):
         super().__init__(config, request, client_address, server)
 
     def proto_logger(self) -> ProtocolLogger:
+        """Create a protocol-specific logger with SMB metadata.
+
+        :return: A logger instance tagged with protocol name, color, host, and port
+        :rtype: ProtocolLogger
+        """
         return ProtocolLogger(
             extra={
                 "protocol": "SMB",
@@ -339,14 +396,23 @@ class SMBHandler(BaseProtoHandler):
         )
 
     def setup(self) -> None:
+        """Log the incoming client connection at debug level."""
         self.logger.debug(f"Incoming connection from {self.client_host}")
 
     def finish(self) -> None:
+        """Log the connection closure at debug level."""
         self.logger.debug(f"Connection to {self.client_host} closed")
 
     # -- Transport --
 
     def send_data(self, payload: bytes, ty: int | None = None) -> None:
+        """Wrap payload in a NetBIOS session packet and send it to the client.
+
+        :param payload: The raw bytes to send as the NetBIOS trailer
+        :type payload: bytes
+        :param ty: NetBIOS session packet type, defaults to NETBIOS_SESSION_MESSAGE
+        :type ty: int | None, optional
+        """
         packet = nmb.NetBIOSSessionPacket()
         packet.set_type(ty or nmb.NETBIOS_SESSION_MESSAGE)
         packet.set_trailer(payload)
@@ -369,6 +435,17 @@ class SMBHandler(BaseProtoHandler):
         the legacy ErrorClass/Reserved/ErrorCode fields.
 
         Spec: [MS-CIFS] §2.2.3.1 (SMB header), [MS-SMB] §2.2.3.1 (Flags2)
+
+        :param command: The SMB1 command code (e.g. ``smb.SMB.SMB_COM_NEGOTIATE``)
+        :type command: int
+        :param data: The SMB command data portion (SMBCommand Data field)
+        :type data: object
+        :param parameters: The SMB command parameters portion (SMBCommand Parameters field)
+        :type parameters: object
+        :param packet: The original client request packet, used to echo PID/TID/MID
+        :type packet: smb.NewSMBPacket
+        :param error_code: NTSTATUS error code for the response, defaults to None (success)
+        :type error_code: int | None, optional
         """
         resp = smb.NewSMBPacket()
         # [MS-CIFS] §2.2.3.1: SMB_FLAGS_REPLY (0x80) on server responses
@@ -417,6 +494,18 @@ class SMBHandler(BaseProtoHandler):
         (e.g., for unsolicited NEGOTIATE responses), uses safe defaults.
 
         Spec: [MS-SMB2] §2.2.1 (SMB2 header), [MS-SMB2] §3.3.5.5.1 (SessionID)
+
+        :param command_data: The serialized SMB2 command response body
+        :type command_data: bytes
+        :param packet: The original client request packet for echoing fields,
+            defaults to None (uses safe defaults)
+        :type packet: typing.Any | None, optional
+        :param command: SMB2 command opcode override when *packet* is None,
+            defaults to None
+        :type command: int | None, optional
+        :param status: NTSTATUS code for the response, defaults to None
+            (STATUS_SUCCESS)
+        :type status: int | None, optional
         """
         resp = smb2.SMB2Packet()
         # [MS-SMB2] §2.2.1: SMB2_FLAGS_SERVER_TO_REDIR (0x01) on responses
@@ -456,7 +545,12 @@ class SMBHandler(BaseProtoHandler):
           0xFF = SMB1 ([MS-SMB])
           0xFE = SMB2/3 ([MS-SMB2])
         and the packet is dispatched to the appropriate command handler via
-        handle_smb_packet(). EnableSMB1/EnableSMB2 config gates each path.
+        :meth:`handle_smb_packet`. EnableSMB1/EnableSMB2 config gates each path.
+
+        :param data: Initial data from the connection (unused; data is read in the loop)
+        :type data: bytes | None
+        :param transport: The transport layer context (unused; kept for interface compatibility)
+        :type transport: typing.Any
         """
         while True:
             data = self.recv(8192)
@@ -517,8 +611,15 @@ class SMBHandler(BaseProtoHandler):
         """Dispatch a parsed SMB packet to the registered command handler.
 
         Looks up the command opcode in the smb1_commands or smb2_commands
-        dispatch table (populated in __init__) and calls the matching
+        dispatch table (populated in :meth:`__init__`) and calls the matching
         handler method. Unrecognized commands terminate the connection.
+
+        :param packet: Parsed SMB packet (SMB1 or SMB2) from the client
+        :type packet: typing.Any
+        :param smbv1: Whether this is an SMB1 packet, defaults to False
+        :type smbv1: bool, optional
+        :raises BaseProtoHandler.TerminateConnection: If the command is not
+            implemented or the handler raises it
         """
         command = packet["Command"]
         command_name = get_command_name(command, 1 if smbv1 else 2)
@@ -539,9 +640,23 @@ class SMBHandler(BaseProtoHandler):
     # -- Logging --
 
     def log_client(self, msg: str, command: str | None = None) -> None:
+        """Log a debug message attributed to the client.
+
+        :param msg: The message text to log
+        :type msg: str
+        :param command: Optional command name to prefix the message with, defaults to None
+        :type command: str | None, optional
+        """
         self.log(msg, command, is_client=True)
 
     def log_server(self, msg: str, command: str | None = None) -> None:
+        """Log a debug message attributed to the server.
+
+        :param msg: The message text to log
+        :type msg: str
+        :param command: Optional command name to prefix the message with, defaults to None
+        :type command: str | None, optional
+        """
         self.log(msg, command, is_server=True)
 
     def log(
@@ -551,6 +666,21 @@ class SMBHandler(BaseProtoHandler):
         is_server: bool = False,
         is_client: bool = False,
     ) -> None:
+        """Log a debug message with optional command prefix and direction tag.
+
+        When *command* is provided, the message is prefixed with
+        ``<command> ``. The *is_server* and *is_client* flags control
+        the directional tag in the log output.
+
+        :param msg: The message text to log
+        :type msg: str
+        :param command: Optional command name to prefix the message with, defaults to None
+        :type command: str | None, optional
+        :param is_server: Tag this message as server-originated, defaults to False
+        :type is_server: bool, optional
+        :param is_client: Tag this message as client-originated, defaults to False
+        :type is_client: bool, optional
+        """
         if command:
             msg = f"<{command}> {msg}"
         self.logger.debug(msg, is_server=is_server, is_client=is_client)
@@ -580,9 +710,16 @@ class SMBHandler(BaseProtoHandler):
         configured error code.
 
         :param token: Raw security token from the SMB session setup request
-        :param command_name: SMB command name for log attribution
-            ("SMB2_SESSION_SETUP" or "SMB_COM_SESSION_SETUP_ANDX")
-        :return: (response_token_bytes, ntstatus_error_code)
+        :type token: bytes
+        :param command_name: SMB command name for log attribution, defaults to
+            "SMB2_SESSION_SETUP"
+        :type command_name: str, optional
+        :raises BaseProtoHandler.TerminateConnection: If the GSSAPI token is
+            malformed, the NTLM token length is invalid, an unsupported
+            NTLM message type is received, or a CHALLENGE_MESSAGE arrives
+            unexpectedly
+        :return: Tuple of (response_token_bytes, ntstatus_error_code)
+        :rtype: tuple[bytes, int]
         """
         is_gssapi = not token.startswith(b"NTLMSSP")
 
@@ -757,6 +894,10 @@ class SMBHandler(BaseProtoHandler):
         returns STATUS_ACCOUNT_DISABLED to trigger the retry. On the final
         attempt, returns the configured error code (default: STATUS_SMB_BAD_UID)
         which ends the session.
+
+        :return: NTSTATUS code -- STATUS_ACCOUNT_DISABLED for intermediate
+            attempts, or the configured final error code
+        :rtype: int
         """
         self.auth_attempt_count += 1
         max_captures = self.smb_config.smb_captures_per_connection
@@ -768,15 +909,34 @@ class SMBHandler(BaseProtoHandler):
     # -- SMB2 command handlers --
 
     def smb3_neg_context_pad(self, data_len: int) -> bytes:
-        # [MS-SMB2] §2.2.4: padding between negotiate contexts for 8-byte
-        # alignment. Spec does not mandate a pad value; Windows uses 0x00.
+        """Compute padding bytes for 8-byte alignment of negotiate contexts.
+
+        [MS-SMB2] §2.2.4: padding between negotiate contexts for 8-byte
+        alignment. Spec does not mandate a pad value; Windows uses 0x00.
+
+        :param data_len: Current data length to pad from
+        :type data_len: int
+        :return: Zero-filled padding bytes (0 to 7 bytes)
+        :rtype: bytes
+        """
         return b"\x00" * ((8 - (data_len % 8)) % 8)
 
     def smb3_build_neg_context_list(
         self,
         context_objects: list[tuple[int, bytes]],
     ) -> bytes:
-        """Encode a list of SMB 3.1.1 negotiate contexts with padding."""
+        """Encode a list of SMB 3.1.1 negotiate contexts with padding.
+
+        Each context is serialized as an :class:`SMB2NegotiateContext` structure
+        followed by padding for 8-byte alignment per [MS-SMB2] §2.2.4.
+
+        :param context_objects: List of ``(context_type, data_bytes)`` tuples
+            where *context_type* is the negotiate context type ID and
+            *data_bytes* is the serialized context payload
+        :type context_objects: list[tuple[int, bytes]]
+        :return: Concatenated and padded negotiate context list
+        :rtype: bytes
+        """
         context_list = b""
         for caps_type, caps in context_objects:
             context = smb3.SMB2NegotiateContext()
@@ -791,7 +951,18 @@ class SMBHandler(BaseProtoHandler):
     def smb3_get_target_capabilities(
         self, request: smb2.SMB2Negotiate
     ) -> tuple[int, ...]:
-        """Extract client's preferred encryption and signing from 3.1.1 contexts."""
+        """Extract client's preferred encryption and signing from 3.1.1 contexts.
+
+        Parses the SMB 3.1.1 negotiate context list from the client's
+        NEGOTIATE request to determine the preferred encryption cipher
+        and signing algorithm. Falls back to AES-128-GCM and AES-CMAC
+        defaults if parsing fails.
+
+        :param request: Parsed SMB2 NEGOTIATE request containing 3.1.1 contexts
+        :type request: smb2.SMB2Negotiate
+        :return: Tuple of ``(target_cipher, target_sign)`` algorithm IDs
+        :rtype: tuple[int, ...]
+        """
         target_cipher = smb3.SMB2_ENCRYPTION_AES128_GCM
         target_sign = 0x001  # SMB2_SIGNING_AES_CMAC
         try:
@@ -826,7 +997,21 @@ class SMBHandler(BaseProtoHandler):
         target_revision: int,
         request: smb2.SMB2Negotiate | None = None,
     ) -> smb2.SMB2Negotiate_Response:
-        """Build an SMB2 NEGOTIATE response — [MS-SMB2] §2.2.4."""
+        """Build an SMB2 NEGOTIATE response -- [MS-SMB2] §2.2.4.
+
+        Constructs a complete NEGOTIATE response with server capabilities,
+        realistic max sizes for direct TCP, a SPNEGO security token, and
+        (for SMB 3.1.1) negotiate contexts for preauth integrity, encryption,
+        and signing algorithms.
+
+        :param target_revision: The selected SMB2 dialect hex constant
+        :type target_revision: int
+        :param request: The client's parsed NEGOTIATE request, used to extract
+            3.1.1 negotiate contexts, defaults to None
+        :type request: smb2.SMB2Negotiate | None, optional
+        :return: The populated SMB2 NEGOTIATE response structure
+        :rtype: smb2.SMB2Negotiate_Response
+        """
         command = smb2.SMB2Negotiate_Response()
         # [MS-SMB2] §2.2.4 / §3.3.5.4: SMB2_NEGOTIATE_SIGNING_ENABLED MUST be set
         command["SecurityMode"] = 0x01
@@ -911,6 +1096,11 @@ class SMBHandler(BaseProtoHandler):
         If no common dialect exists, responds with STATUS_NOT_SUPPORTED.
 
         Spec: [MS-SMB2] §3.3.5.4
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        :raises BaseProtoHandler.TerminateConnection: If the client sends no
+            dialects or no common dialect is available
         """
         req = smb3.SMB2Negotiate(data=packet["Data"])
         dialect_count: int = req["DialectCount"]
@@ -980,11 +1170,14 @@ class SMBHandler(BaseProtoHandler):
 
         Carries the NTLMSSP authentication exchange wrapped in SPNEGO.
         Extracts the security token from the request, passes it to
-        handle_ntlmssp() for processing, and returns the response token
+        :meth:`handle_ntlmssp` for processing, and returns the response token
         with the appropriate NTSTATUS code (STATUS_MORE_PROCESSING_REQUIRED
         while the exchange is in progress, or the final error/success code).
 
         Spec: [MS-SMB2] §3.3.5.5
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
         """
         req = smb2.SMB2SessionSetup(data=packet["Data"])
 
@@ -1016,7 +1209,14 @@ class SMBHandler(BaseProtoHandler):
         )
 
     def handle_smb2_logoff(self, packet: smb2.SMB2Packet) -> None:
-        """Handle SMB2 LOGOFF — [MS-SMB2] §3.3.5.6."""
+        """Handle SMB2 LOGOFF -- [MS-SMB2] §3.3.5.6.
+
+        Logs the client logoff, resets the authenticated flag, and sends
+        a successful LOGOFF response.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
         self.log_client("Client requested logoff", "SMB2_LOGOFF")
         self.logger.display("Client requested logoff")
 
@@ -1029,10 +1229,13 @@ class SMBHandler(BaseProtoHandler):
         )
 
     def handle_smb2_tree_connect(self, packet: smb2.SMB2Packet) -> None:
-        """Minimal SMB2 TREE_CONNECT handler — [MS-SMB2] §3.3.5.7.
+        """Minimal SMB2 TREE_CONNECT handler -- [MS-SMB2] §3.3.5.7.
 
         Accepts all tree connects and responds as IPC$ (pipe share).
         Logs the requested share path for intelligence gathering.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
         """
         try:
             req = smb2.SMB2TreeConnect(data=packet["Data"])
@@ -1057,10 +1260,20 @@ class SMBHandler(BaseProtoHandler):
     # -- SMB1 command handlers --
 
     def handle_smb1_negotiate(self, packet: smb.NewSMBPacket) -> None:
-        """Handle SMB1 NEGOTIATE — [MS-SMB] §3.3.5.2.
+        """Handle SMB1 NEGOTIATE -- [MS-SMB] §3.3.5.2.
 
         Parses the dialect list, checks for SMB2 upgrade, and builds
         the appropriate extended or non-extended security response.
+        Supports three negotiate paths: SMB1-to-SMB2 protocol transition
+        (when AllowSMB1Upgrade is enabled and SMB2 dialect strings are
+        present), SMB1 extended security (NTLMSSP/SPNEGO), and SMB1
+        non-extended security (raw challenge/response or plaintext).
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        :raises BaseProtoHandler.TerminateConnection: If the client sends no
+            dialects or does not offer NT LM 0.12 (and SMB2 upgrade is
+            not available)
         """
         resp = smb.NewSMBPacket()
         resp["Flags1"] = smb.SMB.FLAGS1_REPLY
@@ -1244,9 +1457,16 @@ class SMBHandler(BaseProtoHandler):
         self.send_data(resp.getData())
 
     def handle_smb1_session_setup(self, packet: smb.NewSMBPacket) -> None:
-        """Handle SMB1 SESSION_SETUP_ANDX — [MS-SMB] §3.3.5.3.
+        """Handle SMB1 SESSION_SETUP_ANDX -- [MS-SMB] §3.3.5.3.
 
-        Dispatches to extended (WC=12) or basic (WC=13) path.
+        Dispatches to extended security (WordCount=12, NTLMSSP/SPNEGO via
+        :meth:`handle_ntlmssp`) or basic security (WordCount=13, raw
+        challenge/response via :meth:`handle_smb1_session_setup_basic`).
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        :raises BaseProtoHandler.TerminateConnection: If the WordCount is
+            neither 12 nor 13
         """
         command = smb.SMBCommand(packet["Data"][0])
         # [MS-SMB] §2.2.4.6.1: WordCount == 0x0C for extended security
@@ -1353,6 +1573,12 @@ class SMBHandler(BaseProtoHandler):
 
         Spec: [MS-CIFS] §2.2.4.53.1 (request), §2.2.4.53.2 (response),
               §3.2.4.2.4 (plaintext-despite-challenge)
+
+        :param packet: The original SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        :param command: The parsed SMB command containing session setup parameters
+            and data fields (WordCount=13)
+        :type command: smb.SMBCommand
         """
         cfg = self.smb_config
         setup_params = smb.SMBSessionSetupAndX_Parameters(command["Parameters"])
@@ -1499,7 +1725,13 @@ class SMBHandler(BaseProtoHandler):
     def handle_smb1_tree_connect(self, packet: smb.NewSMBPacket) -> None:
         """Minimal SMB1 TREE_CONNECT_ANDX handler.
 
+        Accepts all tree connects and responds as IPC$ share. Logs the
+        requested share path for intelligence gathering.
+
         Spec: [MS-CIFS] §2.2.4.55, [MS-SMB] §3.3.5.4
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
         """
         try:
             cmd = smb.SMBCommand(packet["Data"][0])
@@ -1548,6 +1780,22 @@ class SMBServer(ThreadingTCPServer):
         server_address: tuple[str, int] | None = None,
         RequestHandlerClass: type | None = None,
     ) -> None:
+        """Initialize the SMB TCP server with a stable ServerGuid.
+
+        Generates a random 16-byte ServerGuid per [MS-SMB2] §2.2.4 that
+        persists for the lifetime of this server instance. Delegates to
+        :class:`ThreadingTCPServer` for socket binding and thread management.
+
+        :param config: The active session configuration
+        :type config: SessionConfig
+        :param server_config: SMB-specific server configuration from TOML
+        :type server_config: SMBServerConfig
+        :param server_address: The ``(bind_address, port)`` tuple, defaults to None
+        :type server_address: tuple[str, int] | None, optional
+        :param RequestHandlerClass: Override handler class, defaults to None
+            (uses :class:`SMBHandler`)
+        :type RequestHandlerClass: type | None, optional
+        """
         self.server_config = server_config
         # Stable ServerGuid per server instance — [MS-SMB2] §2.2.4
         self.server_guid: bytes = secrets.token_bytes(16)
@@ -1556,6 +1804,16 @@ class SMBServer(ThreadingTCPServer):
     def finish_request(
         self, request: typing.Any, client_address: tuple[str, int]
     ) -> None:
+        """Instantiate the handler class to process a single client connection.
+
+        Overrides :meth:`ThreadingTCPServer.finish_request` to pass the
+        additional ``server_config`` argument required by :class:`SMBHandler`.
+
+        :param request: The raw socket/request object for this connection
+        :type request: typing.Any
+        :param client_address: The ``(host, port)`` tuple of the connecting client
+        :type client_address: tuple[str, int]
+        """
         typing.cast("type", self.RequestHandlerClass)(
             self.config, self.server_config, request, client_address, self
         )
