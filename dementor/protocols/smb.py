@@ -48,12 +48,12 @@ from caterpillar.types import uint16_t
 
 from dementor.config.toml import TomlConfig, Attribute as A
 from dementor.config.session import SessionConfig
-from dementor.config.util import get_value, is_true
+from dementor.config.util import is_true
 from dementor.loader import BaseProtocolModule, DEFAULT_ATTR
 from dementor.log.logger import ProtocolLogger, dm_logger
 from dementor.protocols.ntlm import (
     NTLM_AUTH_CreateChallenge,
-    NTLM_AUTH_format_host,
+    NTLM_AUTH_extract_client_fields,
     NTLM_TRANSPORT_CLEARTEXT,
     NTLM_TRANSPORT_RAW,
     NTLM_new_timestamp,
@@ -85,6 +85,54 @@ from dementor.servers import (
 )
 
 __proto__ = ["SMB"]
+
+# --- Helpers -----------------------------------------------------------------
+
+
+def _split_smb_strings(data: bytes, is_unicode: bool) -> list[str]:
+    r"""Split concatenated null-terminated SMB strings from raw bytes.
+
+    Encoding is determined by FLAGS2_UNICODE (passed as *is_unicode*):
+
+    * **ASCII** (``is_unicode=False``): each string is terminated by a
+      single ``\x00``.  Decoded as ASCII with replacement.
+      Per [MS-CIFS] §2.2.1.1 (OEM_STRING).
+    * **UTF-16LE** (``is_unicode=True``): each string is terminated by
+      ``\x00\x00`` at a 2-byte aligned offset from the segment start.
+      Simple ``split(b"\x00\x00")`` is wrong because ``\x00`` can appear
+      within a valid UTF-16LE code unit at an odd offset.
+      Per [MS-CIFS] §2.2.1.1 (UNICODE_STRING).
+
+    :param data: Raw concatenated null-terminated strings
+    :param is_unicode: True when FLAGS2_UNICODE is set
+    :return: List of decoded strings
+    """
+    if not data:
+        return []
+
+    if not is_unicode:
+        # [MS-CIFS] §2.2.1.1: OEM_STRING — single \x00 terminator
+        return [s.decode("ascii", errors="replace") for s in data.split(b"\x00") if s]
+
+    # [MS-CIFS] §2.2.1.1: UNICODE_STRING — \x00\x00 at 2-byte aligned offsets
+    segments: list[str] = []
+    start = 0
+    i = 0
+    while i < len(data) - 1:
+        if data[i] == 0 and data[i + 1] == 0 and (i - start) % 2 == 0:
+            if i > start:
+                segments.append(data[start:i].decode("utf-16-le", errors="replace"))
+            start = i + 2
+            i = start
+        else:
+            i += 1
+    # Trailing segment without null terminator
+    if start < len(data) and len(data) - start >= 2:
+        trailing = data[start:].rstrip(b"\x00")
+        if trailing:
+            segments.append(trailing.decode("utf-16-le", errors="replace"))
+    return segments
+
 
 # --- Constants ---------------------------------------------------------------
 SMB2_DIALECTS = {
@@ -273,7 +321,7 @@ class SMB(BaseProtocolModule[SMBServerConfig]):
     @override
     def create_server_thread(
         self, session: SessionConfig, server_config: SMBServerConfig
-    ) -> BaseServerThread:
+    ) -> BaseServerThread[SMBServerConfig]:
         return ServerThread(
             session,
             server_config,
@@ -392,11 +440,15 @@ class SMBHandler(BaseProtoHandler):
         # STATUS_ACCOUNT_DISABLED to trick Windows SSPI into retrying
         # with a different cached credential.
         self.auth_attempt_count: int = 0
+        # Accumulated client info from all messages (NEGOTIATE, SESSION_SETUP,
+        # AUTHENTICATE). Emitted as a single display line after auth completes.
+        self.client_info: dict[str, str] = {}
 
         self.smb1_commands: dict[int, typing.Any] = {
             smb.SMB.SMB_COM_NEGOTIATE: self.handle_smb1_negotiate,
             smb.SMB.SMB_COM_SESSION_SETUP_ANDX: self.handle_smb1_session_setup,
             smb.SMB.SMB_COM_TREE_CONNECT_ANDX: self.handle_smb1_tree_connect,
+            smb.SMB.SMB_COM_LOGOFF_ANDX: self.handle_smb1_logoff,
         }
         self.smb2_commands: dict[int, typing.Any] = {
             smb2.SMB2_NEGOTIATE: self.handle_smb2_negotiate,
@@ -426,7 +478,8 @@ class SMBHandler(BaseProtoHandler):
         self.logger.debug(f"Incoming connection from {self.client_host}")
 
     def finish(self) -> None:
-        """Log the connection closure at debug level."""
+        """Emit accumulated SMB client info and log connection closure."""
+        self._emit_smb_client_info()
         self.logger.debug(f"Connection to {self.client_host} closed")
 
     # -- Transport --
@@ -598,11 +651,14 @@ class SMBHandler(BaseProtoHandler):
                     calling_name = field.m2i(None, b"\x20" + caller[:-2]).decode(
                         errors="replace"
                     )
-                    # Log the client's NetBIOS machine name (CallingName)
-                    self.logger.display(
+                    self.logger.debug(
                         f"<NETBIOS_SESSION_REQUEST> {calling_name} -> {called_name}",
                         is_client=True,
                     )
+                    if calling_name:
+                        self.client_info["calling"] = calling_name.rstrip()
+                    if called_name:
+                        self.client_info["called"] = called_name.rstrip()
                 except ValueError:
                     pass
                 self.send_data(b"\x00", nmb.NETBIOS_SESSION_POSITIVE_RESPONSE)
@@ -664,6 +720,28 @@ class SMBHandler(BaseProtoHandler):
             raise BaseProtoHandler.TerminateConnection
 
     # -- Logging --
+
+    def _emit_smb_client_info(self) -> None:
+        """Emit a single display line with accumulated SMB-layer client info.
+
+        Called once per connection after all SMB fields have been collected.
+        Includes: NativeOS, NativeLanMan, CallingName, CalledName,
+        AccountName, PrimaryDomain, tree connect Path.
+        """
+        keys = [
+            ("smb_os", "os"),
+            ("smb_lanman", "lanman"),
+            ("calling", "calling"),
+            ("called", "called"),
+            ("account", "account"),
+            ("smb_domain", "domain"),
+            ("path", "path"),
+        ]
+        parts = [
+            f"{label}:{self.client_info[k]}" for k, label in keys if k in self.client_info
+        ]
+        if parts:
+            self.logger.display(f"SMB: {' | '.join(parts)}")
 
     def log_client(self, msg: str, command: str | None = None) -> None:
         """Log a debug message attributed to the client.
@@ -806,12 +884,10 @@ class SMBHandler(BaseProtoHandler):
                 if not is_gssapi:
                     self.log_client("NTLMSSP_NEGOTIATE_MESSAGE", command_name)
 
-                # Extract client OS version and hostname from NEGOTIATE
+                # Accumulate client info from NEGOTIATE for consolidated display
                 try:
-                    client_info = NTLM_AUTH_format_host(negotiate)
-                    self.logger.display(
-                        f"<{command_name}> NTLMSSP client: {client_info}",
-                        is_client=True,
+                    self.client_info.update(
+                        NTLM_AUTH_extract_client_fields(negotiate, is_negotiate=True)
                     )
                     client_flags: int = negotiate["flags"]
                     self.logger.debug(
@@ -821,7 +897,6 @@ class SMBHandler(BaseProtoHandler):
                 except Exception:
                     self.logger.debug(
                         "Failed to extract NTLMSSP negotiate client info",
-                        exc_info=True,
                     )
 
                 # Resolve NTLM identity: NTLM overrides → SMB defaults
@@ -885,7 +960,6 @@ class SMBHandler(BaseProtoHandler):
                 except Exception:
                     self.logger.debug(
                         "Failed to extract NTLMSSP auth flags",
-                        exc_info=True,
                     )
 
                 NTLM_report_auth(
@@ -894,6 +968,7 @@ class SMBHandler(BaseProtoHandler):
                     client=self.client_address,
                     session=self.config,
                     logger=self.logger,
+                    negotiate_info=self.client_info,
                 )
 
                 # Multi-credential capture: returns STATUS_ACCOUNT_DISABLED or final error
@@ -1159,8 +1234,34 @@ class SMBHandler(BaseProtoHandler):
         except Exception:
             self.logger.debug(
                 "Failed to extract SMB2 negotiate client info",
-                exc_info=True,
             )
+
+        # SMB 3.1.1 NegotiateContextList — [MS-SMB2] §2.2.3.1
+        try:
+            ctx_data: bytes = req["NegotiateContextList"] or b""
+            if ctx_data:
+                ctx_types = {
+                    smb2.SMB2_PREAUTH_INTEGRITY_CAPABILITIES: "PREAUTH_INTEGRITY",
+                    smb2.SMB2_ENCRYPTION_CAPABILITIES: "ENCRYPTION",
+                    smb2.SMB2_COMPRESSION_CAPABILITIES: "COMPRESSION",
+                }
+                names: list[str] = []
+                offset = 0
+                while offset < len(ctx_data) - 4:
+                    ctx = smb2.SMB2NegotiateContext(data=ctx_data[offset:])
+                    ct: int = ctx["ContextType"]
+                    dl: int = ctx["DataLength"]
+                    names.append(ctx_types.get(ct, f"0x{ct:04x}"))
+                    # Advance past header (8) + data + 8-byte alignment padding
+                    offset += 8 + dl
+                    offset += (8 - (offset % 8)) % 8
+                if names:
+                    self.logger.debug(
+                        f"<SMB2_NEGOTIATE> NegotiateContexts: {', '.join(names)}",
+                        is_client=True,
+                    )
+        except Exception:
+            self.logger.debug("Failed to parse SMB2 NegotiateContextList")
 
         # Select greatest common dialect within configured min/max range
         cfg = self.smb_config
@@ -1211,7 +1312,7 @@ class SMBHandler(BaseProtoHandler):
         try:
             prev_session: int = req["PreviousSessionId"]
             if prev_session:
-                self.logger.display(
+                self.logger.debug(
                     f"<SMB2_SESSION_SETUP> Reconnecting "
                     f"(PreviousSessionId=0x{prev_session:016x})",
                     is_client=True,
@@ -1245,7 +1346,6 @@ class SMBHandler(BaseProtoHandler):
         :type packet: smb2.SMB2Packet
         """
         self.log_client("Client requested logoff", "SMB2_LOGOFF")
-        self.logger.display("Client requested logoff")
 
         response = smb2.SMB2Logoff_Response()
         self.authenticated = False
@@ -1267,12 +1367,14 @@ class SMBHandler(BaseProtoHandler):
         try:
             req = smb2.SMB2TreeConnect(data=packet["Data"])
             path_bytes: bytes = req["Buffer"][: req["PathLength"]]
+            # [MS-SMB2] §2.2.9: PathName is always UTF-16LE in SMB2
             path = path_bytes.decode("utf-16-le", errors="replace")
-            # Log the requested share path for intelligence gathering
-            self.logger.display(
+            self.logger.debug(
                 f"<SMB2_TREE_CONNECT> Tree connect: {path}",
                 is_client=True,
             )
+            if path:
+                self.client_info["path"] = path
         except Exception:
             self.log_client("Tree connect (malformed)", "SMB2_TREE_CONNECT")
 
@@ -1368,7 +1470,19 @@ class SMBHandler(BaseProtoHandler):
         # Shared negotiate parameters — [MS-CIFS] §2.2.4.52.2
         server_time = get_server_time()
 
-        if packet["Flags2"] & smb.SMB.FLAGS2_EXTENDED_SECURITY:
+        # Respond based on the client's capabilities: if the client sets
+        # FLAGS2_EXTENDED_SECURITY, respond with SPNEGO/NTLMSSP.  If not,
+        # respond with a raw 8-byte challenge so legacy and non-standard
+        # clients (embedded devices, nmap, old Windows) can still
+        # authenticate.  This deviates from modern Windows (which always
+        # sends extended security) but ensures we capture hashes from
+        # EVERY client type, not just modern ones.
+        use_extended = (
+            bool(packet["Flags2"] & smb.SMB.FLAGS2_EXTENDED_SECURITY)
+            and not cfg.smb_force_smb1_plaintext
+        )
+
+        if use_extended:
             # --- Extended security path (NTLMSSP/SPNEGO) ---
             self.smb1_extended_security = True
 
@@ -1431,12 +1545,11 @@ class SMBHandler(BaseProtoHandler):
             )
 
             # DomainName and ServerName — [MS-CIFS] §2.2.4.52.2
-            _dialects_data["DomainName"] = smbserver.encodeSMBString(
+            # Payload is the raw concatenation of DomainName + ServerName;
+            # the virtual DomainName/ServerName fields are parse-time only.
+            _dialects_data["Payload"] = smbserver.encodeSMBString(
                 resp["Flags2"], cfg.smb_nb_domain
-            )
-            _dialects_data["ServerName"] = smbserver.encodeSMBString(
-                resp["Flags2"], cfg.smb_nb_computer
-            )
+            ) + smbserver.encodeSMBString(resp["Flags2"], cfg.smb_nb_computer)
 
             _dialects_parameters["DialectIndex"] = nt_lm_index
             _dialects_parameters["MaxMpxCount"] = SMB1_MAX_MPX_COUNT
@@ -1509,38 +1622,28 @@ class SMBHandler(BaseProtoHandler):
             setup_data["SecurityBlobLength"] = setup_params["SecurityBlobLength"]
             setup_data.fromString(command["Data"])
 
-            # Extract client OS and LAN Manager identification strings
+            # Extract client OS and LAN Manager identification strings.
+            # impacket's AsciiOrUnicodeStructure has a UTF-16BE bug, so
+            # we manually parse from raw bytes after the SecurityBlob.
             try:
-                client_os = (
-                    setup_data["NativeOS"]
-                    .decode(
-                        "utf-16-le"
-                        if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE
-                        else "ascii",
-                        errors="replace",
-                    )
-                    .rstrip("\x00")
-                )
-                client_lanman = (
-                    setup_data["NativeLanMan"]
-                    .decode(
-                        "utf-16-le"
-                        if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE
-                        else "ascii",
-                        errors="replace",
-                    )
-                    .rstrip("\x00")
-                )
-                if client_os or client_lanman:
-                    self.logger.display(
-                        f"<SMB_COM_SESSION_SETUP_ANDX> Client OS: "
-                        f"{client_os!r} LanMan: {client_lanman!r}",
-                        is_client=True,
-                    )
+                is_unicode = bool(packet["Flags2"] & smb.SMB.FLAGS2_UNICODE)
+                blob_len: int = setup_params["SecurityBlobLength"]
+                raw_after_blob = command["Data"][blob_len:]
+                # [MS-CIFS] §2.2.4.53.1: Unicode strings are 2-byte aligned
+                # from the start of the SMB header. When SecurityBlob has
+                # even length, a 1-byte pad precedes the first Unicode string.
+                if is_unicode and len(raw_after_blob) > 0 and raw_after_blob[0] == 0:
+                    raw_after_blob = raw_after_blob[1:]
+                parts = _split_smb_strings(raw_after_blob, is_unicode)
+                client_os = parts[0] if len(parts) > 0 else ""
+                client_lanman = parts[1] if len(parts) > 1 else ""
+                if client_os:
+                    self.client_info["smb_os"] = client_os
+                if client_lanman:
+                    self.client_info["smb_lanman"] = client_lanman
             except Exception:
                 self.logger.debug(
                     "Failed to extract SMB1 session setup client info",
-                    exc_info=True,
                 )
 
             resp_token, error_code = self.handle_ntlmssp(
@@ -1610,56 +1713,46 @@ class SMBHandler(BaseProtoHandler):
         """
         cfg = self.smb_config
         setup_params = smb.SMBSessionSetupAndX_Parameters(command["Parameters"])
-        # [MS-CIFS] §2.2.4.53.1 — request data (not response)
-        setup_data = smb.SMBSessionSetupAndX_Data()
-        setup_data["AnsiPwdLength"] = setup_params["AnsiPwdLength"]
-        setup_data["UnicodePwdLength"] = setup_params["UnicodePwdLength"]
-        setup_data.fromString(command["Data"])
 
         oem_len: int = setup_params["AnsiPwdLength"]
         uni_len: int = setup_params["UnicodePwdLength"]
         is_unicode = bool(packet["Flags2"] & smb.SMB.FLAGS2_UNICODE)
-        encoding = "utf-16-le" if is_unicode else "ascii"
+        # [MS-CIFS] §2.2.4.53.1 — manually parse the data section.
+        # impacket's AsciiStructure truncates at \x00 (wrong for Unicode)
+        # and UnicodeStructure decodes as UTF-16BE (impacket bug).
+        raw_data: bytes = command["Data"]
+        # Password fields come first at known offsets
+        oem_pwd: bytes = raw_data[:oem_len] if oem_len else b""
+        uni_pwd: bytes = raw_data[oem_len : oem_len + uni_len] if uni_len else b""
+        # String fields follow passwords: Account, PrimaryDomain, NativeOS, NativeLanMan
+        # Each is null-terminated in the encoding indicated by FLAGS2_UNICODE.
+        string_data = raw_data[oem_len + uni_len :]
+        # [MS-CIFS] §2.2.4.53.1: Unicode strings are 2-byte aligned.
+        # Detect padding by checking if the first byte is \x00 (same
+        # approach proven on the extended security path).
+        if is_unicode and len(string_data) > 0 and string_data[0] == 0:
+            string_data = string_data[1:]
+        strings = _split_smb_strings(string_data, is_unicode)
+        account = strings[0] if len(strings) > 0 else ""
+        domain = strings[1] if len(strings) > 1 else ""
 
-        # Extract raw credential fields
-        oem_pwd: bytes = setup_data["AnsiPwd"][:oem_len] if oem_len else b""
-        uni_pwd: bytes = setup_data["UnicodePwd"][:uni_len] if uni_len else b""
-
-        account: str = (
-            setup_data["Account"].decode(encoding, errors="replace").rstrip("\x00")
-        )
-        domain: str = (
-            setup_data["PrimaryDomain"].decode(encoding, errors="replace").rstrip("\x00")
-        )
-
-        # Log client account and domain for captured credential context
-        self.logger.display(
+        self.logger.debug(
             f"<SMB_COM_SESSION_SETUP_ANDX> account={account!r} "
             f"domain={domain!r} oem_len={oem_len} uni_len={uni_len}",
             is_client=True,
         )
+        if account:
+            self.client_info["account"] = account
+        if domain:
+            self.client_info["smb_domain"] = domain
 
-        # Extract client OS and LAN Manager identification strings
-        try:
-            client_os = (
-                setup_data["NativeOS"].decode(encoding, errors="replace").rstrip("\x00")
-            )
-            client_lanman = (
-                setup_data["NativeLanMan"]
-                .decode(encoding, errors="replace")
-                .rstrip("\x00")
-            )
-            if client_os or client_lanman:
-                self.logger.display(
-                    f"<SMB_COM_SESSION_SETUP_ANDX> Client OS: "
-                    f"{client_os!r} LanMan: {client_lanman!r}",
-                    is_client=True,
-                )
-        except Exception:
-            self.logger.debug(
-                "Failed to extract SMB1 basic session setup client info",
-                exc_info=True,
-            )
+        # NativeOS and NativeLanMan follow Account and PrimaryDomain
+        client_os = strings[2] if len(strings) > 2 else ""
+        client_lanman = strings[3] if len(strings) > 3 else ""
+        if client_os:
+            self.client_info["smb_os"] = client_os
+        if client_lanman:
+            self.client_info["smb_lanman"] = client_lanman
 
         # Determine transport type — cleartext vs challenge/response
         # [MS-CIFS] §3.2.4.2.4: even when NEGOTIATE_ENCRYPT_PASSWORDS is
@@ -1689,7 +1782,8 @@ class SMBHandler(BaseProtoHandler):
 
         # Capture credentials
         if transport == NTLM_TRANSPORT_CLEARTEXT:
-            # Cleartext password — extract from whichever field is populated
+            # [MS-CIFS] §2.2.4.53.1: cleartext in UnicodePassword (UTF-16LE)
+            # when FLAGS2_UNICODE, else in OEMPassword (ASCII)
             if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE and uni_pwd:
                 password = uni_pwd.decode("utf-16-le", errors="replace")
             elif oem_pwd:
@@ -1738,6 +1832,9 @@ class SMBHandler(BaseProtoHandler):
         resp_data["NativeLanMan"] = smbserver.encodeSMBString(
             packet["Flags2"], cfg.effective_native_lanman
         )
+        resp_data["PrimaryDomain"] = smbserver.encodeSMBString(
+            packet["Flags2"], cfg.smb_nb_domain
+        )
 
         # Determine error code — multi-cred or final
         error_code = self.resolve_auth_error_code()
@@ -1749,6 +1846,27 @@ class SMBHandler(BaseProtoHandler):
             packet,
             error_code=error_code,
         )
+
+    def handle_smb1_logoff(self, packet: smb.NewSMBPacket) -> None:
+        """Handle SMB1 LOGOFF_ANDX -- [MS-CIFS] §2.2.4.54.
+
+        Sends a proper LOGOFF response (AndX parameters only, no data)
+        and terminates the connection.
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        """
+        self.log_client("Client requested logoff", "SMB_COM_LOGOFF_ANDX")
+
+        # SMBLogOffAndX packs the AndX response: 0xFF,0x00,0x0000
+        parameters = smb.SMBLogOffAndX()
+        self.send_smb1_command(
+            smb.SMB.SMB_COM_LOGOFF_ANDX,
+            b"",
+            parameters,
+            packet,
+        )
+        raise BaseProtoHandler.TerminateConnection
 
     def handle_smb1_tree_connect(self, packet: smb.NewSMBPacket) -> None:
         """Minimal SMB1 TREE_CONNECT_ANDX handler.
@@ -1766,19 +1884,22 @@ class SMBHandler(BaseProtoHandler):
             # [MS-CIFS] §2.2.4.55.1 — parse request data for Path field
             tc_data = smb.SMBTreeConnectAndX_Data(flags=packet["Flags2"])
             tc_data.fromString(cmd["Data"])
+            raw_path = tc_data["Path"]
+            # [MS-CIFS] §2.2.4.55.1: Path encoding per FLAGS2_UNICODE
             path = (
-                tc_data["Path"]
-                .decode(
+                raw_path.decode(
                     "utf-16-le" if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE else "ascii",
                     errors="replace",
                 )
-                .rstrip("\x00")
-            )
-            # Log the requested share path for intelligence gathering
-            self.logger.display(
+                if isinstance(raw_path, bytes)
+                else str(raw_path)
+            ).rstrip("\x00")
+            self.logger.debug(
                 f"<SMB_COM_TREE_CONNECT_ANDX> Tree connect: {path}",
                 is_client=True,
             )
+            if path:
+                self.client_info["path"] = path
         except Exception:
             self.log_client("Tree connect (malformed)", "SMB_COM_TREE_CONNECT_ANDX")
 

@@ -422,31 +422,36 @@ def NTLM_AUTH_decode_string(
 ) -> str:
     """Decode an NTLM wire string into a Python str.
 
+    Encoding is determined by protocol rules, not heuristics:
+
+    * **NEGOTIATE_MESSAGE** (``is_negotiate_oem=True``): always OEM/ASCII.
+      Unicode has not been negotiated yet per [MS-NLMP] §2.2.1.1.
+    * **AUTHENTICATE_MESSAGE** (``is_negotiate_oem=False``): encoding is
+      determined by ``NTLMSSP_NEGOTIATE_UNICODE`` (flag A, 0x00000001)
+      in the message's NegotiateFlags.  When set → UTF-16LE, else OEM
+      (cp437 as baseline).  Per [MS-NLMP] §2.2.1.3.
+
     :param data: Raw bytes from the NTLM message field
     :type data: bytes | None
-    :param negotiate_flags: NegotiateFlags from the message. Determines encoding for
-        CHALLENGE_MESSAGE and AUTHENTICATE_MESSAGE fields
+    :param negotiate_flags: NegotiateFlags from the message
     :type negotiate_flags: int
-    :param is_negotiate_oem: If True, forces OEM/ASCII decoding regardless of flags.
-        Set this when decoding fields from a NEGOTIATE_MESSAGE, where Unicode
-        negotiation has not yet occurred per [MS-NLMP section 2.2]
+    :param is_negotiate_oem: True for NEGOTIATE_MESSAGE fields (forces ASCII)
     :type is_negotiate_oem: bool
     :return: Decoded string. Returns "" for None or empty input.
-        Malformed bytes are replaced with U+FFFD rather than raising
     :rtype: str
     """
     if not data:
         return ""
 
-    # NEGOTIATE_MESSAGE fields: always OEM -- Unicode has not been negotiated yet
+    # [MS-NLMP] §2.2.1.1: NEGOTIATE_MESSAGE fields are always OEM
     if is_negotiate_oem:
         return data.decode("ascii", errors="replace")
 
-    # CHALLENGE_MESSAGE / AUTHENTICATE_MESSAGE fields: encoding governed by flags
+    # [MS-NLMP] §2.2.1.3: AUTHENTICATE_MESSAGE encoding per NEGOTIATE_UNICODE
     if negotiate_flags & ntlm.NTLMSSP_NEGOTIATE_UNICODE:
-        return data.decode("utf-16le", errors="replace")
+        return data.decode("utf-16-le", errors="replace").rstrip("\x00")
 
-    # OEM fallback -- cp437 as baseline; actual code page is system-dependent
+    # OEM fallback — cp437 as baseline; actual code page is system-dependent
     return data.decode("cp437", errors="replace")
 
 
@@ -493,23 +498,25 @@ def _compute_dummy_lm_responses(server_challenge: bytes) -> set[bytes]:
 # --- Extraction --------------------------------------------------------------
 
 
-def NTLM_AUTH_format_host(
+def NTLM_AUTH_extract_client_fields(
     token: ntlm.NTLMAuthChallengeResponse | ntlm.NTLMAuthNegotiate,
-) -> str:
-    """Extract a human-readable host description from an NTLM message.
+    is_negotiate: bool = False,
+) -> dict[str, str]:
+    """Extract client info fields from an NTLM message as a dict.
 
     Works with both NEGOTIATE_MESSAGE and AUTHENTICATE_MESSAGE — both
-    contain VERSION, host_name, and domain_name fields.
+    contain VERSION, host_name, and domain_name fields. Returns only
+    non-empty fields. Never raises.
 
     :param token: Parsed NEGOTIATE_MESSAGE or AUTHENTICATE_MESSAGE
     :type token: ntlm.NTLMAuthChallengeResponse | ntlm.NTLMAuthNegotiate
-    :return: "OS [ (name: HOSTNAME) ] [ (domain: DOMAIN) ]" Never raises
-    :rtype: str
+    :param is_negotiate: True when token is a NEGOTIATE_MESSAGE (forces OEM
+        decoding per [MS-NLMP] §2.2.1.1)
+    :type is_negotiate: bool
+    :return: Dict with keys like ``"os"``, ``"name"``, ``"domain"``
+    :rtype: dict[str, str]
     """
-    flags: int = 0
-    hostname: str = ""
-    domain_name: str = ""
-    os_version: str = "0.0.0"
+    info: dict[str, str] = {}
 
     try:
         flags = token["flags"]
@@ -517,7 +524,7 @@ def NTLM_AUTH_format_host(
             NTLM_AUTH_decode_string(
                 token["host_name"],
                 flags,
-                is_negotiate_oem=True,
+                is_negotiate_oem=is_negotiate,
             )
             or ""
         )
@@ -525,48 +532,69 @@ def NTLM_AUTH_format_host(
             NTLM_AUTH_decode_string(
                 token["domain_name"],
                 flags,
-                is_negotiate_oem=True,
+                is_negotiate_oem=is_negotiate,
             )
             or ""
         )
+        if hostname:
+            info["name"] = hostname
+        if domain_name:
+            info["domain"] = domain_name
     except Exception:
         dm_logger.debug(
-            "Failed to parse hostname/domain from NEGOTIATE_MESSAGE",
-            exc_info=True,
+            "Failed to parse hostname/domain from NTLM message",
         )
 
     # Parse the OS VERSION structure separately so a version parse failure
     # does not discard the already-decoded hostname and domain.
-    try:
-        ver_raw: bytes = token["Version"]
-        major: int = ver_raw[0]
-        minor: int = ver_raw[1]
-        build: int = uint16.from_bytes(ver_raw[2:4], order=LittleEndian)
+    if "Version" in token.fields:
+        try:
+            ver_raw: bytes = token["Version"]
+            major: int = ver_raw[0]
+            minor: int = ver_raw[1]
+            build: int = uint16.from_bytes(ver_raw[2:4], order=LittleEndian)
 
-        os_version = f"{major}.{minor}"
-        if build in WIN_VERSIONS:
-            os_version = f"{WIN_VERSIONS[build]}"
+            os_version = f"{major}.{minor}"
+            if build in WIN_VERSIONS:
+                os_version = f"{WIN_VERSIONS[build]}"
+            if build:
+                os_version = f"{os_version} Build {build}"
+            if (major, minor, build) == (6, 1, 0):
+                os_version = "Unix - Samba"
 
-        if build:
-            os_version = f"{os_version} Build {build}"
+            info["os"] = os_version
 
-        if (major, minor, build) == (6, 1, 0):
-            os_version = "Unix - Samba"
+        except Exception:
+            dm_logger.debug(
+                "Failed to parse OS version from NTLM message",
+            )
 
-    except Exception:
-        dm_logger.debug(
-            "Failed to parse OS version from NEGOTIATE_MESSAGE; using 0.0.0",
-            exc_info=True,
-        )
+    return info
 
-    host_info = os_version
-    if hostname:
-        host_info += f" (name: {hostname})"
 
-    if domain_name:
-        host_info += f" (domain: {domain_name})"
+def NTLM_AUTH_format_host(
+    token: ntlm.NTLMAuthChallengeResponse | ntlm.NTLMAuthNegotiate,
+) -> str | None:
+    """Extract a human-readable host description from an NTLM message.
 
-    return host_info
+    Convenience wrapper around :func:`NTLM_AUTH_extract_client_fields`.
+
+    :param token: Parsed NEGOTIATE_MESSAGE or AUTHENTICATE_MESSAGE
+    :type token: ntlm.NTLMAuthChallengeResponse | ntlm.NTLMAuthNegotiate
+    :return: Formatted string or ``None`` if no info was extracted
+    :rtype: str | None
+    """
+    info = NTLM_AUTH_extract_client_fields(token)
+    if not info:
+        return None
+    parts: list[str] = []
+    if "os" in info:
+        parts.append(info["os"])
+    if "name" in info:
+        parts.append(f"(name: {info['name']})")
+    if "domain" in info:
+        parts.append(f"(domain: {info['domain']})")
+    return " ".join(parts) if parts else None
 
 
 # Output formats validated against hashcat module source code
@@ -1190,7 +1218,7 @@ def NTLM_AUTH_CreateChallenge(
 def _log_ntlmv2_blob_info(
     auth_token: ntlm.NTLMAuthChallengeResponse,
     log: ProtocolLogger,
-) -> None:
+) -> str | None:
     """Extract and log client-side AV_PAIRs from an NTLMv2 response blob.
 
     The NTLMv2 NtChallengeResponse is ``NTProofStr(16)`` + ``CLIENT_CHALLENGE`` blob.
@@ -1204,16 +1232,19 @@ def _log_ntlmv2_blob_info(
     :type auth_token: ntlm.NTLMAuthChallengeResponse
     :param log: Logger instance for output
     :type log: ProtocolLogger
+    :return: MsvAvTargetName (SPN) if present, else None
+    :rtype: str | None
     """
+    target_name: str | None = None
     try:
         nt_response: bytes = auth_token["ntlm"] or b""
         if len(nt_response) <= NTLMV1_RESPONSE_LEN:
-            return  # NTLMv1 — no blob
+            return None  # NTLMv1 — no blob
 
         # NTLMv2 blob starts after NTProofStr (16 bytes)
         blob = nt_response[NTLM_NTPROOFSTR_LEN:]
         if len(blob) < 32:
-            return  # Minimum blob: header(28) + MsvAvEOL(4) = 32 bytes
+            return None  # Minimum blob: header(28) + MsvAvEOL(4) = 32 bytes
 
         # The blob has a fixed header before the AV_PAIRs:
         # Resp(1) + HiResp(1) + Reserved1(2) + Reserved2(4) + TimeStamp(8)
@@ -1226,33 +1257,42 @@ def _log_ntlmv2_blob_info(
 
         av_data = blob[28:]
         if not av_data:
-            return
+            return None
 
         av_pairs = ntlm.AV_PAIRS(av_data)
 
+        # impacket AV_PAIRS.__getitem__ returns (length, value_bytes) tuples
+
         # MsvAvTargetName (0x0009) — SPN the client is targeting
         if ntlm.NTLMSSP_AV_TARGET_NAME in av_pairs.fields:
-            target_name = av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME].decode(
-                "utf-16-le", errors="replace"
-            )
+            _, spn_raw = av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME]
+            target_name = spn_raw.decode("utf-16-le", errors="replace")
             if target_name:
-                log.display(f"Client targeting SPN: {target_name}")
+                log.debug(f"MsvAvTargetName (SPN): {target_name}")
 
-        # MsvAvTimestamp (0x0007) — client-side timestamp (debug)
+        # MsvAvTimestamp (0x0007) — client-side timestamp
         if ntlm.NTLMSSP_AV_TIME in av_pairs.fields:
-            log.debug(
-                "NTLMv2 blob contains MsvAvTimestamp (client echoed server timestamp)"
-            )
+            _, ts_raw = av_pairs[ntlm.NTLMSSP_AV_TIME]
+            if len(ts_raw) >= 8:
+                ts_val = int.from_bytes(ts_raw[:8], "little")
+                log.debug(f"MsvAvTimestamp: 0x{ts_val:016x}")
 
         # MsvAvFlags (0x0006) — constrained auth / MIC / untrusted SPN
         if ntlm.NTLMSSP_AV_FLAGS in av_pairs.fields:
-            flags_raw: bytes = av_pairs[ntlm.NTLMSSP_AV_FLAGS]
+            _, flags_raw = av_pairs[ntlm.NTLMSSP_AV_FLAGS]
             if len(flags_raw) >= 4:
                 av_flags = int.from_bytes(flags_raw[:4], "little")
-                log.debug(f"NTLMv2 blob MsvAvFlags: 0x{av_flags:08x}")
+                log.debug(f"MsvAvFlags: 0x{av_flags:08x}")
+
+        # MsvAvChannelBindings (0x000A) — MD5 of channel binding token
+        if ntlm.NTLMSSP_AV_CHANNEL_BINDINGS in av_pairs.fields:
+            _, cb_raw = av_pairs[ntlm.NTLMSSP_AV_CHANNEL_BINDINGS]
+            log.debug(f"MsvAvChannelBindings: {cb_raw.hex()}")
 
     except Exception:
         log.debug("Failed to parse NTLMv2 blob AV_PAIRs", exc_info=True)
+
+    return target_name
 
 
 def NTLM_report_auth(
@@ -1263,6 +1303,7 @@ def NTLM_report_auth(
     logger: ProtocolLogger | None = None,
     extras: dict[str, Any] | None = None,
     transport: str = NTLM_TRANSPORT_NTLMSSP,
+    negotiate_info: dict[str, str] | None = None,
 ) -> None:
     """Extract all crackable hashes from an AUTHENTICATE_MESSAGE and log them.
 
@@ -1284,6 +1325,9 @@ def NTLM_report_auth(
     :type extras: dict | None
     :param transport: NTLM transport identifier (NTLM_TRANSPORT_*); used for logging only
     :type transport: str
+    :param negotiate_info: Client fields extracted from the NEGOTIATE_MESSAGE
+        (merged with AUTHENTICATE fields for consolidated display)
+    :type negotiate_info: dict[str, str] | None
     """
     # Use the protocol logger for session-linked messages; fall back to the
     # module logger when no protocol logger is provided.
@@ -1299,6 +1343,19 @@ def NTLM_report_auth(
         method = log.display if logger else log.debug
         method("Anonymous NTLM login attempt; skipping hash extraction")
         return
+
+    # MIC (Message Integrity Code) — 16-byte HMAC present only when
+    # NTLMSSP_NEGOTIATE_VERSION (0x02000000) is set in the AUTHENTICATE
+    # flags.  Without VERSION, impacket's checkMIC() returns 0 for the
+    # MIC length and the "MIC" field contains leaked adjacent data.
+    try:
+        auth_flags_raw: int = auth_token["flags"]
+        if auth_flags_raw & ntlm.NTLMSSP_NEGOTIATE_VERSION:
+            mic: bytes = auth_token["MIC"]
+            if mic and len(mic) == 16 and mic != b"\x00" * 16:
+                log.debug(f"AUTHENTICATE MIC: {mic.hex()}")
+    except Exception:  # noqa: S110
+        pass  # MIC field absent or unparseable
 
     try:
         negotiate_flags: int = auth_token["flags"]
@@ -1330,6 +1387,35 @@ def NTLM_report_auth(
             negotiate_flags,
         )
 
+        # Consolidated NTLM client info line: NEGOTIATE + AUTHENTICATE fields
+        ntlm_info: dict[str, str] = dict(negotiate_info) if negotiate_info else {}
+        ntlm_info.update(NTLM_AUTH_extract_client_fields(auth_token))
+        if user_name:
+            ntlm_info["user"] = user_name
+        if domain_name:
+            ntlm_info["domain"] = domain_name
+        if ntlm_info:
+            display_keys = [
+                ("os", "os"),
+                ("user", "user"),
+                ("domain", "domain"),
+                ("name", "name"),
+            ]
+            parts = [
+                f"{label}:{ntlm_info[k]}" for k, label in display_keys if k in ntlm_info
+            ]
+            if parts:
+                log.display(f"NTLM: {' | '.join(parts)}")
+
+        # Extract NTLMv2 client blob AV_PAIRs — MsvAvTargetName displayed
+        # to user if novel, rest are debug only
+        spn = _log_ntlmv2_blob_info(auth_token, log)
+        # Display MsvAvTargetName if non-null and not redundant with info above
+        if spn:
+            known_values = {v.lower() for v in ntlm_info.values() if isinstance(v, str)}
+            if spn.lower() not in known_values:
+                log.display(f"NTLM: target SPN: {spn}")
+
         log.debug(
             "Writing %d hash(es) to capture database for user=%r domain=%r",
             len(all_hashes),
@@ -1339,9 +1425,6 @@ def NTLM_report_auth(
         host_info = NTLM_AUTH_format_host(auth_token)
         extras = extras or {}
         extras[_HOST_INFO] = host_info
-
-        # Extract NTLMv2 client blob AV_PAIRs for intelligence
-        _log_ntlmv2_blob_info(auth_token, log)
 
         for version_label, hashcat_line in all_hashes:
             session.db.add_auth(
@@ -1415,6 +1498,9 @@ def NTLM_report_raw_fields(
         if isinstance(user_name, (bytes, bytearray, memoryview))
         else (user_name or "")
     )
+    # Protocol handlers should decode strings before calling this function.
+    # The bytes fallback assumes UTF-16LE for safety — only reachable if
+    # a caller passes raw bytes directly.
     domain: str = (
         domain_name.decode("utf-16-le", errors="replace")
         if isinstance(domain_name, (bytes, bytearray, memoryview))
