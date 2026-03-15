@@ -130,6 +130,9 @@ SMB1_MAX_BUFFER_SIZE: int = 16644
 # STATUS_ACCOUNT_DISABLED — used for multi-credential SSPI retry
 STATUS_ACCOUNT_DISABLED: int = 0xC0000072
 
+# [MS-SMB2] §2.2.3.1.7: SMB2_SIGNING_CAPABILITIES negotiate context type
+SMB2_SIGNING_CAPABILITIES_ID: int = 0x0008
+
 
 # (missing in impacket struct definitions)
 # [MS-SMB2] §2.2.3.1.7 SMB2_SIGNING_CAPABILITIES
@@ -985,7 +988,7 @@ class SMBHandler(BaseProtoHandler):
         :rtype: tuple[int, ...]
         """
         target_cipher = smb3.SMB2_ENCRYPTION_AES128_GCM
-        target_sign = 0x001  # SMB2_SIGNING_AES_CMAC
+        target_sign = 0x001  # [MS-SMB2] §2.2.3.1.7: AES-CMAC signing algorithm
         try:
             context_data = smb3.SMB311ContextData(request["ClientStartTime"])
             context_list_offset = context_data["NegotiateContextOffset"] - 64
@@ -1001,7 +1004,7 @@ class SMBHandler(BaseProtoHandler):
                             req_enc_caps["Ciphers"],
                             order=LittleEndian,
                         )
-                    case 0x0008:
+                    case 0x0008:  # SMB2_SIGNING_CAPABILITIES_ID
                         req_sign_caps = SMB2SigningCapabilities.from_bytes(
                             context["Data"]
                         )
@@ -1068,7 +1071,7 @@ class SMBHandler(BaseProtoHandler):
 
             # [MS-SMB2] §2.2.3.1.2 SMB2_ENCRYPTION_CAPABILITIES
             target_cipher = smb3.SMB2_ENCRYPTION_AES128_GCM
-            target_sign = 0x001  # SMB2_SIGNING_AES_CMAC
+            target_sign = 0x001  # [MS-SMB2] §2.2.3.1.7: AES-CMAC signing algorithm
             if request:
                 target_cipher, target_sign = self.smb3_get_target_capabilities(request)
 
@@ -1091,7 +1094,7 @@ class SMBHandler(BaseProtoHandler):
                         smb3.SMB2_ENCRYPTION_CAPABILITIES,
                         enc_caps.getData(),
                     ),
-                    (0x0008, sign_caps.to_bytes()),
+                    (SMB2_SIGNING_CAPABILITIES_ID, sign_caps.to_bytes()),
                 ]
             )
 
@@ -1220,6 +1223,7 @@ class SMBHandler(BaseProtoHandler):
             req["Buffer"], command_name="SMB2_SESSION_SETUP"
         )
         command["SecurityBufferLength"] = len(resp_token)
+        # [MS-SMB2] §2.2.6: offset from header start (64 hdr + 8 fixed = 0x48)
         command["SecurityBufferOffset"] = 0x48
         command["Buffer"] = resp_token
 
@@ -1438,6 +1442,7 @@ class SMBHandler(BaseProtoHandler):
             _dialects_parameters["MaxBufferSize"] = SMB1_MAX_BUFFER_SIZE
             _dialects_parameters["MaxRawSize"] = 65536
             _dialects_parameters["SessionKey"] = 0
+            # [MS-CIFS] §2.2.4.52.2: SystemTime as FILETIME split into 32-bit words
             _dialects_parameters["LowDateTime"] = server_time & 0xFFFFFFFF
             _dialects_parameters["HighDateTime"] = (server_time >> 32) & 0xFFFFFFFF
             _dialects_parameters["ServerTimeZone"] = 0
@@ -1776,7 +1781,8 @@ class SMBHandler(BaseProtoHandler):
             self.log_client("Tree connect (malformed)", "SMB_COM_TREE_CONNECT_ANDX")
 
         resp_params = smb.SMBTreeConnectAndXResponse_Parameters()
-        resp_params["OptionalSupport"] = 0x0001  # SMB_SUPPORT_SEARCH_BITS
+        # [MS-CIFS] §2.2.4.55.2: SMB_SUPPORT_SEARCH_BITS
+        resp_params["OptionalSupport"] = 0x0001
         resp_data = smb.SMBTreeConnectAndXResponse_Data(flags=packet["Flags2"])
         resp_data["Service"] = b"IPC\x00"
         resp_data["NativeFileSystem"] = smbserver.encodeSMBString(packet["Flags2"], "")

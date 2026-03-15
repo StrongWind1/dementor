@@ -1165,10 +1165,11 @@ def NTLM_AUTH_CreateChallenge(
             )
 
         # MsvAvTimestamp (0x0007) is intentionally NOT included.
-        # Per §3.3.2 rule 7: when the server sends MsvAvTimestamp, the
-        # client MUST NOT send an LmChallengeResponse (sets it to Z(24)).
-        # Omitting it ensures clients still send a real LMv2 alongside the
-        # NetNTLMv2 response, maximising the number of captured hash types.
+        # [MS-NLMP] §2.2.2.1 footnote <15> says "always sent" but the
+        # normative §3.2.5.1.1 pseudocode does NOT include AddAvPair for it.
+        # Per §3.3.2: when MsvAvTimestamp IS present, the client SHOULD NOT
+        # send LmChallengeResponse (sends Z(24) instead), losing the LMv2
+        # companion hash. Omitting it maximizes captured hash types.
         challenge_message["TargetInfoFields_len"] = len(av_pairs)
         challenge_message["TargetInfoFields_max_len"] = len(av_pairs)
         challenge_message["TargetInfoFields"] = av_pairs
