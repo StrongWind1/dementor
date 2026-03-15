@@ -71,9 +71,11 @@ from dementor.protocols.ntlm import (
     ATTR_NTLM_DNS_TREE,
 )
 from dementor.protocols.spnego import (
-    negTokenInit_step,
-    negTokenInit,
+    NEG_STATE_ACCEPT_INCOMPLETE,
+    NEG_STATE_REJECT,
     SPNEGO_NTLMSSP_MECH,
+    build_neg_token_init,
+    build_neg_token_resp,
 )
 from dementor.servers import (
     BaseProtoHandler,
@@ -771,8 +773,8 @@ class SMBHandler(BaseProtoHandler):
                         f"<{command_name}> Unsupported mechanism: "
                         f"{name} ({mech_type.hex()})"
                     )
-                    resp = negTokenInit_step(
-                        0x02,
+                    resp = build_neg_token_resp(
+                        NEG_STATE_REJECT,
                         supported_mech=SPNEGO_NTLMSSP_MECH,
                     )
                     return (
@@ -850,8 +852,8 @@ class SMBHandler(BaseProtoHandler):
                 )
                 self.log_server("NTLMSSP_CHALLENGE_MESSAGE", command_name)
                 if is_gssapi:
-                    resp = negTokenInit_step(
-                        0x01,
+                    resp = build_neg_token_resp(
+                        NEG_STATE_ACCEPT_INCOMPLETE,
                         challenge.getData(),
                         supported_mech=SPNEGO_NTLMSSP_MECH,
                     )
@@ -896,7 +898,7 @@ class SMBHandler(BaseProtoHandler):
 
                 # Multi-credential capture: returns STATUS_ACCOUNT_DISABLED or final error
                 error_code = self.resolve_auth_error_code()
-                resp = negTokenInit_step(0x02)
+                resp = build_neg_token_resp(NEG_STATE_REJECT)
 
             case message_type:
                 self.log_client(f"NTLMSSP: unknown {message_type:02x}", command_name)
@@ -1057,7 +1059,7 @@ class SMBHandler(BaseProtoHandler):
         command["SecurityBufferOffset"] = 0x80
 
         # [MS-SMB2] §3.3.5.4 / [MS-SPNG] §3.2.5.2: SPNEGO negTokenInit2
-        blob = negTokenInit([SPNEGO_NTLMSSP_MECH])
+        blob = build_neg_token_init([SPNEGO_NTLMSSP_MECH])
         command["Buffer"] = blob.getData()
         command["SecurityBufferLength"] = len(command["Buffer"])
 
@@ -1381,7 +1383,7 @@ class SMBHandler(BaseProtoHandler):
             _dialects_data = smb.SMBExtended_Security_Data()
             # Stable ServerGuid per server instance — [MS-SMB2] §2.2.4
             _dialects_data["ServerGUID"] = self.server.server_guid  # type: ignore[union-attr]
-            blob = negTokenInit([SPNEGO_NTLMSSP_MECH])
+            blob = build_neg_token_init([SPNEGO_NTLMSSP_MECH])
             _dialects_data["SecurityBlob"] = blob.getData()
 
             _dialects_parameters = smb.SMBExtended_Security_Parameters()
