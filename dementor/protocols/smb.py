@@ -289,9 +289,21 @@ class SMBHandler(BaseProtoHandler):
         self.smb1_extended_security: bool = True
         self.smb1_challenge: bytes = server_config.ntlm_challenge
         self.smb1_negotiate_encrypt: bool = True
-        self.smb1_uid: int = 0  # G6: allocated on first session setup
-        self.smb2_session_id: int = 0  # G5: allocated on first session setup
-        self.auth_attempt_count: int = 0  # G1: multi-credential counter
+        # Server-assigned user ID for this SMB1 session. Allocated on
+        # first session setup; 0 means no session yet. Clients echo this
+        # in subsequent requests to identify their session.
+        # [MS-SMB] §3.3.5.3
+        self.smb1_uid: int = 0
+        # Server-assigned session ID for this SMB2 session. Allocated on
+        # first session setup; 0 means no session yet. Must never be 0
+        # or -1 in responses after allocation. [MS-SMB2] §3.3.5.5.1
+        self.smb2_session_id: int = 0
+        # Tracks how many credential captures have occurred on this
+        # connection. Used to implement multi-credential capture: after
+        # each capture (except the last), the server returns
+        # STATUS_ACCOUNT_DISABLED to trick Windows SSPI into retrying
+        # with a different cached credential.
+        self.auth_attempt_count: int = 0
 
         self.smb1_commands: dict[int, typing.Any] = {
             smb.SMB.SMB_COM_NEGOTIATE: self.handle_smb1_negotiate,
@@ -338,18 +350,21 @@ class SMBHandler(BaseProtoHandler):
         packet: smb.NewSMBPacket,
         error_code: int | None = None,
     ) -> None:
-        """Build and send an SMB1 response.
+        """Build and send an SMB1 response wrapped in a NetBIOS session packet.
 
-        G3: Flags2 is derived from the connection's security mode —
-        FLAGS2_EXTENDED_SECURITY is only set when smb1_extended_security
-        is True.
-        G6: Uid is set from smb1_uid when allocated.
+        Constructs the full SMB1 response header with correct Flags1
+        (reply bit), Flags2 (mode-aware: EXTENDED_SECURITY only set when
+        the connection negotiated extended security), echoed PID/TID/MID,
+        the server-assigned Uid, and the NTSTATUS error code split into
+        the legacy ErrorClass/Reserved/ErrorCode fields.
+
+        Spec: [MS-CIFS] §2.2.3.1 (SMB header), [MS-SMB] §2.2.3.1 (Flags2)
         """
         resp = smb.NewSMBPacket()
         # [MS-CIFS] §2.2.3.1: SMB_FLAGS_REPLY (0x80) on server responses
         resp["Flags1"] = smb.SMB.FLAGS1_REPLY
 
-        # G3: mode-aware Flags2 — [MS-SMB] §2.2.3.1
+        # Flags2 depends on security mode — [MS-SMB] §2.2.3.1
         flags2 = (
             smb.SMB.FLAGS2_NT_STATUS
             | smb.SMB.FLAGS2_LONG_NAMES
@@ -362,7 +377,7 @@ class SMBHandler(BaseProtoHandler):
         resp["Pid"] = packet["Pid"]
         resp["Tid"] = packet["Tid"]
         resp["Mid"] = packet["Mid"]
-        # G6: set Uid — [MS-SMB] §3.3.5.3
+        # Server-assigned session UID — [MS-SMB] §3.3.5.3
         if self.smb1_uid:
             resp["Uid"] = self.smb1_uid
         if error_code:
@@ -384,9 +399,14 @@ class SMBHandler(BaseProtoHandler):
         command: int | None = None,
         status: int | None = None,
     ) -> None:
-        """Build and send an SMB2 response.
+        """Build and send an SMB2 response wrapped in a NetBIOS session packet.
 
-        G5: SessionID is set from smb2_session_id when allocated.
+        Constructs the full SMB2 header with the server-to-client flag,
+        NTSTATUS code, echoed command/credit/message fields, and the
+        server-assigned SessionID. When no request packet is provided
+        (e.g., for unsolicited NEGOTIATE responses), uses safe defaults.
+
+        Spec: [MS-SMB2] §2.2.1 (SMB2 header), [MS-SMB2] §3.3.5.5.1 (SessionID)
         """
         resp = smb2.SMB2Packet()
         # [MS-SMB2] §2.2.1: SMB2_FLAGS_SERVER_TO_REDIR (0x01) on responses
@@ -406,7 +426,7 @@ class SMBHandler(BaseProtoHandler):
         resp["Command"] = packet["Command"]
         resp["CreditCharge"] = packet["CreditCharge"]
         resp["Reserved"] = packet["Reserved"]
-        # G5: proper SessionID — [MS-SMB2] §3.3.5.5.1
+        # Server-assigned SessionID — [MS-SMB2] §3.3.5.5.1
         resp["SessionID"] = self.smb2_session_id
         resp["MessageID"] = packet["MessageID"]
         resp["TreeID"] = packet["TreeID"]
@@ -417,6 +437,17 @@ class SMBHandler(BaseProtoHandler):
     # -- Dispatch --
 
     def handle_data(self, data: bytes | None, transport: typing.Any) -> None:
+        """Main connection loop: receive, decode, and dispatch SMB packets.
+
+        Each TCP connection is wrapped in NetBIOS session framing (RFC 1002).
+        This loop reads NetBIOS packets, handles session requests (port 139),
+        discards keep-alives, then extracts the SMB payload. The first byte
+        of the payload determines the SMB version:
+          0xFF = SMB1 ([MS-SMB])
+          0xFE = SMB2/3 ([MS-SMB2])
+        and the packet is dispatched to the appropriate command handler via
+        handle_smb_packet(). EnableSMB1/EnableSMB2 config gates each path.
+        """
         while True:
             data = self.recv(8192)
             if not data:
@@ -437,7 +468,7 @@ class SMBHandler(BaseProtoHandler):
                     calling_name = field.m2i(None, b"\x20" + caller[:-2]).decode(
                         errors="replace"
                     )
-                    # G12: CallingName is verbose per CLIENT_EXTRACTION.md
+                    # Log the client's NetBIOS machine name (CallingName)
                     self.logger.display(
                         f"<NETBIOS_SESSION_REQUEST> {calling_name} -> {called_name}",
                         is_client=True,
@@ -473,6 +504,12 @@ class SMBHandler(BaseProtoHandler):
             self.handle_smb_packet(packet, smbv1)
 
     def handle_smb_packet(self, packet: typing.Any, smbv1: bool = False) -> None:
+        """Dispatch a parsed SMB packet to the registered command handler.
+
+        Looks up the command opcode in the smb1_commands or smb2_commands
+        dispatch table (populated in __init__) and calls the matching
+        handler method. Unrecognized commands terminate the connection.
+        """
         command = packet["Command"]
         command_name = get_command_name(command, 1 if smbv1 else 2)
         title = f"SMBv{1 if smbv1 else 2} command {command_name} ({command:#04x})"
@@ -515,15 +552,31 @@ class SMBHandler(BaseProtoHandler):
         token: bytes,
         command_name: str = "SMB2_SESSION_SETUP",
     ) -> tuple[bytes, int]:
-        """Handle the NTLMSSP 3-message exchange (SPNEGO or raw).
+        """Handle the NTLMSSP 3-message authentication exchange.
 
-        G8: command_name is parameterized for correct log attribution.
-        G1: multi-credential capture via resolve_auth_error_code().
-        G5/G6: session IDs allocated on first session setup.
+        NTLM authentication over SMB uses a 3-message handshake:
+          1. Client sends NEGOTIATE_MESSAGE (flags, version hints)
+          2. Server replies with CHALLENGE_MESSAGE (8-byte nonce, AV_PAIRs)
+          3. Client sends AUTHENTICATE_MESSAGE (hashed credentials)
+
+        The token may be wrapped in SPNEGO/GSSAPI (tags 0x60/0xA1) or
+        sent as raw NTLMSSP. This method unwraps SPNEGO if present, then
+        dispatches based on the NTLM message type byte at offset 8.
+
+        On the first call, allocates both SMB1 Uid and SMB2 SessionID
+        for this connection. After capturing credentials from the
+        AUTHENTICATE_MESSAGE, returns either STATUS_ACCOUNT_DISABLED
+        (to trigger a retry with different credentials) or the final
+        configured error code.
+
+        :param token: Raw security token from the SMB session setup request
+        :param command_name: SMB command name for log attribution
+            ("SMB2_SESSION_SETUP" or "SMB_COM_SESSION_SETUP_ANDX")
+        :return: (response_token_bytes, ntstatus_error_code)
         """
         is_gssapi = not token.startswith(b"NTLMSSP")
 
-        # G5/G6: allocate session IDs on first session setup
+        # Allocate session IDs on first session setup
         if self.smb2_session_id == 0:
             # [MS-SMB2] §3.3.5.5.1: MUST NOT be 0 or -1
             self.smb2_session_id = secrets.randbelow(0xFFFFFFFFFFFFFFFE) + 1
@@ -580,7 +633,7 @@ class SMBHandler(BaseProtoHandler):
                 if not is_gssapi:
                     self.log_client("NTLMSSP_NEGOTIATE_MESSAGE", command_name)
 
-                # G12: extract client info from NEGOTIATE_MESSAGE
+                # Extract client OS version and hostname from NEGOTIATE
                 try:
                     client_info = NTLM_AUTH_format_host(negotiate)
                     self.logger.display(
@@ -649,7 +702,7 @@ class SMBHandler(BaseProtoHandler):
                 if not is_gssapi:
                     self.log_client("NTLMSSP_AUTHENTICATE_MESSAGE", command_name)
 
-                # G12: log final negotiated flags (debug)
+                # Log the final negotiated NTLMSSP flags
                 try:
                     auth_flags: int = authenticate["flags"]
                     self.logger.debug(
@@ -670,7 +723,7 @@ class SMBHandler(BaseProtoHandler):
                     logger=self.logger,
                 )
 
-                # G1: multi-credential capture
+                # Multi-credential capture: returns STATUS_ACCOUNT_DISABLED or final error
                 error_code = self.resolve_auth_error_code()
                 resp = negTokenInit_step(0x02)
 
@@ -685,9 +738,15 @@ class SMBHandler(BaseProtoHandler):
     def resolve_auth_error_code(self) -> int:
         """Determine the NTSTATUS error code for the current auth attempt.
 
-        Implements the multi-credential capture loop (G1): if more captures
-        remain, return STATUS_ACCOUNT_DISABLED to trigger SSPI retry.
-        Otherwise return the configured final error code.
+        Windows SSPI retries authentication with alternate cached
+        credentials when it receives STATUS_ACCOUNT_DISABLED (0xC0000072).
+        This allows capturing multiple credential hashes per connection
+        (e.g., the interactive user's hash AND a service account hash).
+
+        If more captures remain (auth_attempt_count < CapturesPerConnection),
+        returns STATUS_ACCOUNT_DISABLED to trigger the retry. On the final
+        attempt, returns the configured error code (default: STATUS_SMB_BAD_UID)
+        which ends the session.
         """
         self.auth_attempt_count += 1
         max_captures = self.smb_config.smb_captures_per_connection
@@ -763,7 +822,7 @@ class SMBHandler(BaseProtoHandler):
         command["SecurityMode"] = 0x01
         # [MS-SMB2] §3.3.5.4: set to the common dialect
         command["DialectRevision"] = target_revision
-        # G7: stable ServerGuid per server instance — [MS-SMB2] §2.2.4
+        # Stable ServerGuid per server instance — [MS-SMB2] §2.2.4
         command["ServerGuid"] = self.server.server_guid  # type: ignore[union-attr]
         # Realistic capabilities — [MS-SMB2] §2.2.4
         command["Capabilities"] = SMB2_SERVER_CAPABILITIES
@@ -831,7 +890,18 @@ class SMBHandler(BaseProtoHandler):
         return command
 
     def handle_smb2_negotiate(self, packet: smb2.SMB2Packet) -> None:
-        """Handle SMB2 NEGOTIATE — [MS-SMB2] §3.3.5.4."""
+        """Handle an SMB2 NEGOTIATE request from the client.
+
+        The client sends a list of SMB2 dialect versions it supports.
+        The server selects the greatest common dialect within its
+        configured min/max range and responds with server capabilities,
+        a SPNEGO security token, and (for SMB 3.1.1) negotiate contexts
+        for preauth integrity, encryption, and signing algorithms.
+
+        If no common dialect exists, responds with STATUS_NOT_SUPPORTED.
+
+        Spec: [MS-SMB2] §3.3.5.4
+        """
         req = smb3.SMB2Negotiate(data=packet["Data"])
         dialect_count: int = req["DialectCount"]
         req_raw_dialects: list[int] = req["Dialects"]
@@ -851,7 +921,7 @@ class SMBHandler(BaseProtoHandler):
             "SMB2_NEGOTIATE",
         )
 
-        # G12: client info extraction — [MS-SMB2] §2.2.3
+        # Extract client SecurityMode and Capabilities — [MS-SMB2] §2.2.3
         try:
             sec_mode: int = req["SecurityMode"]
             client_caps: int = req["Capabilities"]
@@ -896,10 +966,19 @@ class SMBHandler(BaseProtoHandler):
         self.send_smb2_command(command.getData())
 
     def handle_smb2_session_setup(self, packet: smb2.SMB2Packet) -> None:
-        """Handle SMB2 SESSION_SETUP — [MS-SMB2] §3.3.5.5."""
+        """Handle an SMB2 SESSION_SETUP request.
+
+        Carries the NTLMSSP authentication exchange wrapped in SPNEGO.
+        Extracts the security token from the request, passes it to
+        handle_ntlmssp() for processing, and returns the response token
+        with the appropriate NTSTATUS code (STATUS_MORE_PROCESSING_REQUIRED
+        while the exchange is in progress, or the final error/success code).
+
+        Spec: [MS-SMB2] §3.3.5.5
+        """
         req = smb2.SMB2SessionSetup(data=packet["Data"])
 
-        # G12: log PreviousSessionId — nonzero indicates reconnection
+        # Log PreviousSessionId — nonzero indicates session reconnection
         try:
             prev_session: int = req["PreviousSessionId"]
             if prev_session:
@@ -949,7 +1028,7 @@ class SMBHandler(BaseProtoHandler):
             req = smb2.SMB2TreeConnect(data=packet["Data"])
             path_bytes: bytes = req["Buffer"][: req["PathLength"]]
             path = path_bytes.decode("utf-16-le", errors="replace")
-            # G12: tree connect path — verbose per CLIENT_EXTRACTION.md
+            # Log the requested share path for intelligence gathering
             self.logger.display(
                 f"<SMB2_TREE_CONNECT> Tree connect: {path}",
                 is_client=True,
@@ -1052,7 +1131,7 @@ class SMBHandler(BaseProtoHandler):
             )
 
             _dialects_data = smb.SMBExtended_Security_Data()
-            # G7: stable ServerGuid per server instance
+            # Stable ServerGuid per server instance — [MS-SMB2] §2.2.4
             _dialects_data["ServerGUID"] = self.server.server_guid  # type: ignore[union-attr]
             blob = negTokenInit([SPNEGO_NTLMSSP_MECH])
             _dialects_data["SecurityBlob"] = blob.getData()
@@ -1172,7 +1251,7 @@ class SMBHandler(BaseProtoHandler):
             setup_data["SecurityBlobLength"] = setup_params["SecurityBlobLength"]
             setup_data.fromString(command["Data"])
 
-            # G12: extract client NativeOS and NativeLanMan
+            # Extract client OS and LAN Manager identification strings
             try:
                 client_os = (
                     setup_data["NativeOS"]
@@ -1229,7 +1308,7 @@ class SMBHandler(BaseProtoHandler):
                 error_code=error_code,
             )
         elif command["WordCount"] == 13:
-            # Non-extended security — [MS-CIFS] §2.2.4.53.1 (G2)
+            # Non-extended security — [MS-CIFS] §2.2.4.53.1
             self.handle_smb1_session_setup_basic(packet, command)
         else:
             self.logger.warning(
@@ -1245,11 +1324,25 @@ class SMBHandler(BaseProtoHandler):
     ) -> None:
         """Handle SMB1 non-extended SESSION_SETUP_ANDX (WordCount=13).
 
-        Extracts raw LM/NT challenge-response fields or cleartext passwords
-        from pre-NTLMSSP clients. Uses NTLM_report_raw_fields() for hash
-        classification and capture. See G2 and G4 in IMPLEMENTATION_PLAN.md.
+        This path handles pre-Vista clients and embedded SMB stacks that
+        don't support NTLMSSP/SPNEGO. Instead of a 3-message NTLMSSP
+        exchange, the client sends raw LM and NT challenge-response hashes
+        (or cleartext passwords) directly in the OEMPassword and
+        UnicodePassword fields of the session setup request.
 
-        Spec: [MS-CIFS] §2.2.4.53.1
+        The server sent an 8-byte challenge in the negotiate response;
+        the client hashed its password against that challenge. This method
+        extracts those raw hashes, classifies them (NetNTLMv1 vs NetNTLMv2
+        based on response length), and formats them for offline cracking.
+
+        Also detects two special cases:
+        - Cleartext passwords when the server advertised plaintext mode
+          (ForceSMB1Plaintext=true, i.e., NEGOTIATE_ENCRYPT_PASSWORDS cleared)
+        - Unexpected cleartext despite challenge (non-standard response
+          lengths when challenge mode was active)
+
+        Spec: [MS-CIFS] §2.2.4.53.1 (request), §2.2.4.53.2 (response),
+              §3.2.4.2.4 (plaintext-despite-challenge)
         """
         cfg = self.smb_config
         setup_params = smb.SMBSessionSetupAndX_Parameters(command["Parameters"])
@@ -1275,14 +1368,14 @@ class SMBHandler(BaseProtoHandler):
             setup_data["PrimaryDomain"].decode(encoding, errors="replace").rstrip("\x00")
         )
 
-        # G12: account/domain — verbose per CLIENT_EXTRACTION.md
+        # Log client account and domain for captured credential context
         self.logger.display(
             f"<SMB_COM_SESSION_SETUP_ANDX> account={account!r} "
             f"domain={domain!r} oem_len={oem_len} uni_len={uni_len}",
             is_client=True,
         )
 
-        # G12: extract client NativeOS and NativeLanMan
+        # Extract client OS and LAN Manager identification strings
         try:
             client_os = (
                 setup_data["NativeOS"].decode(encoding, errors="replace").rstrip("\x00")
@@ -1367,7 +1460,7 @@ class SMBHandler(BaseProtoHandler):
             )
         # else: anonymous — skip capture
 
-        # G6: allocate Uid for basic-security path — [MS-SMB] §3.3.5.3
+        # Allocate Uid for this session — [MS-SMB] §3.3.5.3
         if self.smb1_uid == 0:
             self.smb1_uid = secrets.randbelow(0xFFFE) + 1
 
@@ -1411,7 +1504,7 @@ class SMBHandler(BaseProtoHandler):
                 )
                 .rstrip("\x00")
             )
-            # G12: tree connect path — verbose per CLIENT_EXTRACTION.md
+            # Log the requested share path for intelligence gathering
             self.logger.display(
                 f"<SMB_COM_TREE_CONNECT_ANDX> Tree connect: {path}",
                 is_client=True,
@@ -1446,7 +1539,7 @@ class SMBServer(ThreadingTCPServer):
         RequestHandlerClass: type | None = None,
     ) -> None:
         self.server_config = server_config
-        # G7: stable ServerGuid per server instance — [MS-SMB2] §2.2.4
+        # Stable ServerGuid per server instance — [MS-SMB2] §2.2.4
         self.server_guid: bytes = secrets.token_bytes(16)
         super().__init__(config, server_address, RequestHandlerClass)
 
