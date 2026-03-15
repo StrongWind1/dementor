@@ -441,6 +441,13 @@ def smb2_negotiate_protocol(handler: "SMBHandler", packet: smb2.SMB2Packet) -> N
     )
     if dialect is None:
         handler.logger.fail(f"Client requested unsupported dialects: {str_req_dialects}")
+        # [MS-SMB2] §3.3.5.4: respond with STATUS_NOT_SUPPORTED
+        err_resp = smb2.SMB2Negotiate_Response()
+        handler.send_smb2_command(
+            err_resp.getData(),
+            status=nt_errors.STATUS_NOT_SUPPORTED,
+            command=smb2.SMB2_NEGOTIATE,
+        )
         raise BaseProtoHandler.TerminateConnection
 
     command = smb2_negotiate(handler, dialect, req)
@@ -545,28 +552,23 @@ def smb1_negotiate_protocol(handler: "SMBHandler", packet: smb.NewSMBPacket) -> 
     cfg = handler.smb_config
 
     # Check for SMB2 dialect strings for protocol transition
-    # [MS-SMB2] §3.3.5.3.1
-    smb2_entries: dict[str, int] = {}
+    # [MS-SMB2] §3.3.5.3.1 — only when AllowSMB1Upgrade and EnableSMB2
+    smb2_upgrade_target: str | None = None
     if cfg.smb_allow_smb1_upgrade and cfg.smb_enable_smb2:
-        smb2_entries = {
+        smb2_entries: dict[str, int] = {
             dialect: index
             for index, dialect in enumerate(dialects)
             if dialect in SMB2_DIALECT_REV
         }
+        if smb2_entries:
+            # Prefer "SMB 2.???" wildcard per [MS-SMB2] §3.3.5.3.1
+            if "SMB 2.???" in smb2_entries:
+                smb2_upgrade_target = "SMB 2.???"
+            else:
+                smb2_upgrade_target = list(smb2_entries)[-1]
 
-    if smb2_entries:
-        index, target_dialect = (
-            smb2_entries.get("SMB 2.???"),
-            "SMB 2.???",
-        )
-        if index is None:
-            target_dialect = list(smb2_entries)[-1]
-            index = smb2_entries[target_dialect]
-    else:
-        index, target_dialect = 0, dialects[0]
-
-    if target_dialect in SMB2_DIALECT_REV:
-        command = smb2_negotiate(handler, SMB2_DIALECT_REV[target_dialect])
+    if smb2_upgrade_target is not None:
+        command = smb2_negotiate(handler, SMB2_DIALECT_REV[smb2_upgrade_target])
         handler.log_server("Switching protocol to SMBv2", "SMB_COM_NEGOTIATE")
         handler.send_smb2_command(command.getData(), command=smb2.SMB2_NEGOTIATE)
         return
@@ -579,7 +581,9 @@ def smb1_negotiate_protocol(handler: "SMBHandler", packet: smb.NewSMBPacket) -> 
             break
 
     if nt_lm_index is None:
-        handler.logger.fail("Client did not offer NT LM 0.12 dialect")
+        handler.logger.fail(
+            "Client did not offer NT LM 0.12 dialect (and SMB2 upgrade not available)"
+        )
         raise BaseProtoHandler.TerminateConnection
 
     # Shared negotiate parameters — [MS-CIFS] §2.2.4.52.2
@@ -685,7 +689,7 @@ def smb1_negotiate_protocol(handler: "SMBHandler", packet: smb.NewSMBPacket) -> 
     command["Data"] = _dialects_data
     command["Parameters"] = _dialects_parameters
 
-    handler.log_server(f"selected dialect: {target_dialect}", "SMB_COM_NEGOTIATE")
+    handler.log_server("selected dialect: NT LM 0.12", "SMB_COM_NEGOTIATE")
     resp.addCommand(command)
     handler.send_data(resp.getData())
 
@@ -826,12 +830,28 @@ def smb1_session_setup_basic(
         )
 
     # Determine transport type — cleartext vs challenge/response
+    # [MS-CIFS] §3.2.4.2.4: even when NEGOTIATE_ENCRYPT_PASSWORDS is set,
+    # the server "MAY also accept plaintext." Detect cleartext-despite-
+    # challenge via non-standard response lengths.
     if not handler.smb1_negotiate_encrypt:
         # Server advertised plaintext mode (ForceSMB1Plaintext=true)
         transport = NTLM_TRANSPORT_CLEARTEXT
     elif oem_len == 0 and uni_len == 0:
         # Anonymous — no credentials at all
         transport = None
+    elif handler.smb1_negotiate_encrypt and (
+        # Only OEM populated with non-standard length (not 0, not 24)
+        (uni_len == 0 and oem_len not in (0, 24) and oem_len <= 256)
+        # Only Unicode populated with non-standard length
+        or (oem_len == 0 and uni_len not in (0, 24) and uni_len <= 512)
+    ):
+        # Unexpected plaintext despite challenge — [MS-CIFS] §3.2.4.2.4
+        handler.logger.display(
+            "<SMB_COM_SESSION_SETUP_ANDX> Plaintext password detected "
+            "despite challenge (unusual client behavior)",
+            is_client=True,
+        )
+        transport = NTLM_TRANSPORT_CLEARTEXT
     else:
         transport = NTLM_TRANSPORT_RAW
 
