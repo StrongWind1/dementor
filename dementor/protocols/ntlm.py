@@ -504,10 +504,15 @@ def _compute_dummy_lm_responses(server_challenge: bytes) -> set[bytes]:
 # ===========================================================================
 
 
-def NTLM_AUTH_format_host(token: ntlm.NTLMAuthChallengeResponse) -> str:
-    """Extract a human-readable host description from a CHALLENGE_MESSAGE.
+def NTLM_AUTH_format_host(
+    token: ntlm.NTLMAuthChallengeResponse | ntlm.NTLMAuthNegotiate,
+) -> str:
+    """Extract a human-readable host description from an NTLM message.
 
-    :param ntlm.NTLMAuthChallengeResponse token: Parsed CHALLENGE_MESSAGE from the client
+    Works with both NEGOTIATE_MESSAGE and AUTHENTICATE_MESSAGE — both
+    contain VERSION, host_name, and domain_name fields.
+
+    :param token: Parsed NEGOTIATE_MESSAGE or AUTHENTICATE_MESSAGE
     :return: "OS [ (name: HOSTNAME) ] [ (domain: DOMAIN) ]" Never raises
     :rtype: str
     """
@@ -1196,6 +1201,64 @@ def NTLM_AUTH_CreateChallenge(
 # ===========================================================================
 
 
+def _log_ntlmv2_blob_info(
+    auth_token: ntlm.NTLMAuthChallengeResponse,
+    log: ProtocolLogger,
+) -> None:
+    """Extract and log client-side AV_PAIRs from an NTLMv2 blob (G12).
+
+    The NTLMv2 NtChallengeResponse is NTProofStr(16) + CLIENT_CHALLENGE blob.
+    The blob contains AV_PAIRs that the client copied from the server's
+    CHALLENGE_MESSAGE, plus client-added pairs like MsvAvTargetName (SPN),
+    MsvAvTimestamp, and MsvAvFlags.
+
+    Only called when NtChallengeResponse length > 24 (NTLMv2).
+    """
+    try:
+        nt_response: bytes = auth_token["ntlm"] or b""
+        if len(nt_response) <= NTLMV1_RESPONSE_LEN:
+            return  # NTLMv1 — no blob
+
+        # NTLMv2 blob starts after NTProofStr (16 bytes)
+        blob = nt_response[NTLM_NTPROOFSTR_LEN:]
+        if len(blob) < 28:
+            return  # Minimum blob: header(28) + at least MsvAvEOL(4)
+
+        # The blob has a fixed header before the AV_PAIRs:
+        # Resp(1) + HiResp(1) + Reserved1(2) + Reserved2(4) + TimeStamp(8)
+        #   + ChallengeFromClient(8) + Reserved3(4) = 28 bytes
+        # AV_PAIRs start at offset 28 in the blob.
+        av_data = blob[28:]
+        if not av_data:
+            return
+
+        av_pairs = ntlm.AV_PAIRS(av_data)
+
+        # MsvAvTargetName (0x0009) — SPN the client is targeting
+        if ntlm.NTLMSSP_AV_TARGET_NAME in av_pairs.fields:
+            target_name = av_pairs[ntlm.NTLMSSP_AV_TARGET_NAME].decode(
+                "utf-16-le", errors="replace"
+            )
+            if target_name:
+                log.display(f"Client targeting SPN: {target_name}")
+
+        # MsvAvTimestamp (0x0007) — client-side timestamp (debug)
+        if ntlm.NTLMSSP_AV_TIME in av_pairs.fields:
+            log.debug(
+                "NTLMv2 blob contains MsvAvTimestamp (client echoed server timestamp)"
+            )
+
+        # MsvAvFlags (0x0006) — constrained auth / MIC / untrusted SPN
+        if ntlm.NTLMSSP_AV_FLAGS in av_pairs.fields:
+            flags_raw: bytes = av_pairs[ntlm.NTLMSSP_AV_FLAGS]
+            if len(flags_raw) >= 4:
+                av_flags = int.from_bytes(flags_raw[:4], "little")
+                log.debug(f"NTLMv2 blob MsvAvFlags: 0x{av_flags:08x}")
+
+    except Exception:
+        log.debug("Failed to parse NTLMv2 blob AV_PAIRs", exc_info=True)
+
+
 def NTLM_report_auth(
     auth_token: ntlm.NTLMAuthChallengeResponse,
     challenge: bytes,
@@ -1273,8 +1336,10 @@ def NTLM_report_auth(
         host_info = NTLM_AUTH_format_host(auth_token)
         extras = extras or {}
         extras[_HOST_INFO] = host_info
-        # REVISIT: this should be added once SMB1 legacy commands are implemented
-        # "Transport": transport,
+
+        # G12: extract NTLMv2 client blob AV_PAIRs for intelligence
+        _log_ntlmv2_blob_info(auth_token, log)
+
         for version_label, hashcat_line in all_hashes:
             session.db.add_auth(
                 client=client,
