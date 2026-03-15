@@ -894,6 +894,7 @@ def NTLM_AUTH_is_anonymous(token: ntlm.NTLMAuthChallengeResponse) -> bool:
         nt_response: bytes = token["ntlm"] or b""
         lm_response: bytes = token["lanman"] or b""
 
+        # [MS-NLMP] §3.2.5.1.2: structural anonymous detection
         is_anon = (
             len(user_name) == 0
             and len(nt_response) == 0
@@ -903,7 +904,8 @@ def NTLM_AUTH_is_anonymous(token: ntlm.NTLMAuthChallengeResponse) -> bool:
             dm_logger.debug("Structurally anonymous AUTHENTICATE_MESSAGE detected")
             return True
 
-        return is_anon or bool(flags & ntlm.NTLMSSP_NEGOTIATE_ANONYMOUS)
+        # [MS-NLMP] §2.2.2.5 flag J: supplementary anonymous flag check
+        return bool(flags & ntlm.NTLMSSP_NEGOTIATE_ANONYMOUS)
 
     except Exception:
         dm_logger.debug(
@@ -1015,23 +1017,23 @@ def NTLM_AUTH_CreateChallenge(
     if not disable_ntlmv2:
         response_flags |= ntlm.NTLMSSP_NEGOTIATE_TARGET_INFO
 
-    # -- NTLM protocol flag (mandatory echo) -------------------------------
-    if client_flags & ntlm.NTLMSSP_NEGOTIATE_NTLM:
-        response_flags |= ntlm.NTLMSSP_NEGOTIATE_NTLM
+    # -- Mandatory flags per [MS-NLMP] §2.2.2.5 / §3.2.5.1.1 -------------
+    # NTLMSSP_NEGOTIATE_NTLM (flag H): MUST be set in CHALLENGE_MESSAGE.
+    response_flags |= ntlm.NTLMSSP_NEGOTIATE_NTLM
+    # NTLMSSP_NEGOTIATE_ALWAYS_SIGN (flag M): MUST be set in CHALLENGE_MESSAGE.
+    response_flags |= ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN
 
     # -- Echo client-requested capability flags ----------------------------
-    # Dementor does not implement signing/sealing but MUST echo these so
-    # the client proceeds to send the AUTHENTICATE_MESSAGE.  The protocol
-    # handler (SMB, HTTP, LDAP) ends the session gracefully after capture.
+    # [MS-NLMP] §2.2.2.5: Dementor does not implement signing/sealing but
+    # MUST echo these so the client proceeds to send the AUTHENTICATE_MESSAGE.
     for flag in (
-        ntlm.NTLMSSP_NEGOTIATE_UNICODE,
-        ntlm.NTLM_NEGOTIATE_OEM,
-        ntlm.NTLMSSP_NEGOTIATE_56,
-        ntlm.NTLMSSP_NEGOTIATE_128,
-        ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH,
-        ntlm.NTLMSSP_NEGOTIATE_SIGN,  # MUST echo per [MS-NLMP section 2.2.1.2]
-        ntlm.NTLMSSP_NEGOTIATE_SEAL,
-        ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+        ntlm.NTLMSSP_NEGOTIATE_UNICODE,  # flag A
+        ntlm.NTLM_NEGOTIATE_OEM,  # flag B
+        ntlm.NTLMSSP_NEGOTIATE_56,  # flag W: echo if client sets SEAL or SIGN
+        ntlm.NTLMSSP_NEGOTIATE_128,  # flag U: echo if client sets SEAL or SIGN
+        ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH,  # flag V
+        ntlm.NTLMSSP_NEGOTIATE_SIGN,  # flag D: MUST echo per §2.2.1.2
+        ntlm.NTLMSSP_NEGOTIATE_SEAL,  # flag E: MUST echo per §2.2.2.5
     ):
         if client_flags & flag:
             response_flags |= flag
@@ -1143,20 +1145,14 @@ def NTLM_AUTH_CreateChallenge(
         )  # 0x0005
 
         # 3. Encoding -------------------------------------------------------
-        # NTLM_AUTH_encode_string selects UTF-16LE or OEM based on the
-        # negotiated UNICODE flag in response_flags.  Per §2.2.2.1 (note),
-        # TargetInfo AV_PAIR values MUST be Unicode regardless of the
-        # negotiated encoding; all modern clients negotiate UNICODE, so this
-        # is consistent in practice.
-        nb_computer_bytes = NTLM_AUTH_encode_string(nb_computer_str, response_flags)
-        nb_domain_bytes = NTLM_AUTH_encode_string(nb_domain_str, response_flags)
-        dns_computer_bytes = NTLM_AUTH_encode_string(dns_computer_str, response_flags)
-        dns_domain_bytes = NTLM_AUTH_encode_string(dns_domain_str, response_flags)
-        dns_tree_bytes = (
-            NTLM_AUTH_encode_string(dns_tree_str, response_flags)
-            if dns_tree_str
-            else None
-        )
+        # [MS-NLMP] §2.2.1.2: "If a TargetInfo AV_PAIR Value is textual,
+        # it MUST be encoded in Unicode irrespective of what character set
+        # was negotiated."  Force UTF-16LE regardless of negotiated flags.
+        nb_computer_bytes = nb_computer_str.encode("utf-16le")
+        nb_domain_bytes = nb_domain_str.encode("utf-16le")
+        dns_computer_bytes = dns_computer_str.encode("utf-16le")
+        dns_domain_bytes = dns_domain_str.encode("utf-16le")
+        dns_tree_bytes = dns_tree_str.encode("utf-16le") if dns_tree_str else None
 
         # 4. AV_PAIRS -------------------------------------------------------
         av_pairs = ntlm.AV_PAIRS()
@@ -1221,8 +1217,8 @@ def _log_ntlmv2_blob_info(
 
         # NTLMv2 blob starts after NTProofStr (16 bytes)
         blob = nt_response[NTLM_NTPROOFSTR_LEN:]
-        if len(blob) < 28:
-            return  # Minimum blob: header(28) + at least MsvAvEOL(4)
+        if len(blob) < 32:
+            return  # Minimum blob: header(28) + MsvAvEOL(4) = 32 bytes
 
         # The blob has a fixed header before the AV_PAIRs:
         # Resp(1) + HiResp(1) + Reserved1(2) + Reserved2(4) + TimeStamp(8)

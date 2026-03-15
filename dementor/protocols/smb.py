@@ -88,6 +88,7 @@ SMB2_NEGOTIABLE_DIALECTS = set(SMB2_DIALECTS) - {smb2.SMB2_DIALECT_WILDCARD}
 
 SMB2_DIALECT_REV = {v: k for k, v in SMB2_DIALECTS.items()}
 
+# [MS-SMB2] §2.2.3.1.1: SHA-512 hash algorithm ID = 0x0001
 SMB2_INTEGRITY_SHA512 = uint16.to_bytes(0x0001, order=LittleEndian)
 
 # String-to-hex mapping for SMB2 dialect config values
@@ -266,7 +267,9 @@ def SMB_get_command_name(command: int, smb_version: int) -> str:
 
 # --- SMB3 --------------------------------------------------------------------
 def SMB3_get_neg_context_pad(data_len: int) -> bytes:
-    return b"\xff" * ((8 - (data_len % 8)) % 8)
+    # [MS-SMB2] §2.2.4: padding between negotiate contexts for 8-byte alignment.
+    # Spec does not mandate a pad value; Windows uses 0x00.
+    return b"\x00" * ((8 - (data_len % 8)) % 8)
 
 
 def SMB3_build_neg_context_list(
@@ -322,7 +325,9 @@ def smb2_negotiate(
     request: smb2.SMB2Negotiate | None = None,
 ) -> smb2.SMB2Negotiate_Response:
     command = smb2.SMB2Negotiate_Response()
-    command["SecurityMode"] = 0x01  # signing enabled, not enforced
+    # [MS-SMB2] §2.2.4 / §3.3.5.4: SMB2_NEGOTIATE_SIGNING_ENABLED MUST be set
+    command["SecurityMode"] = 0x01
+    # [MS-SMB2] §3.3.5.4: set to the common dialect
     command["DialectRevision"] = target_revision
     # G7: stable ServerGuid per server instance — [MS-SMB2] §2.2.4
     command["ServerGuid"] = handler.server.server_guid  # type: ignore[union-attr]
@@ -332,11 +337,14 @@ def smb2_negotiate(
     command["MaxTransactSize"] = SMB2_MAX_TRANSACT_SIZE
     command["MaxReadSize"] = SMB2_MAX_READ_SIZE
     command["MaxWriteSize"] = SMB2_MAX_WRITE_SIZE
+    # [MS-SMB2] §2.2.4: SystemTime set to current time in FILETIME format
     command["SystemTime"] = SMB_get_server_time()
-    # [MS-SMB2] §3.3.5.4: ServerStartTime SHOULD be zero
+    # [MS-SMB2] §3.3.5.4: ServerStartTime SHOULD be zero <286>
     command["ServerStartTime"] = 0
+    # [MS-SMB2] §2.2.4: offset from SMB2 header to Buffer (64+64=0x80)
     command["SecurityBufferOffset"] = 0x80
 
+    # [MS-SMB2] §3.3.5.4 / [MS-SPNG] §3.2.5.2: SPNEGO negTokenInit2
     blob = negTokenInit([SPNEGO_NTLMSSP_MECH])
     command["Buffer"] = blob.getData()
     command["SecurityBufferLength"] = len(command["Buffer"])
@@ -511,11 +519,12 @@ def smb2_tree_connect(handler: "SMBHandler", packet: smb2.SMB2Packet) -> None:
     except Exception:
         handler.log_client("Tree connect (malformed)", "SMB2_TREE_CONNECT")
 
+    # [MS-SMB2] §2.2.10: SMB2 TREE_CONNECT Response
     resp = smb2.SMB2TreeConnect_Response()
-    resp["ShareType"] = 0x02  # SMB2_SHARE_TYPE_PIPE (IPC$)
-    resp["ShareFlags"] = 0x00000030  # SMB2_SHAREFLAG_NO_CACHING
-    resp["Capabilities"] = 0
-    resp["MaximalAccess"] = 0x001F01FF  # FILE_ALL_ACCESS
+    resp["ShareType"] = 0x02  # [MS-SMB2] §2.2.10: SMB2_SHARE_TYPE_PIPE
+    resp["ShareFlags"] = 0x00000030  # [MS-SMB2] §2.2.10: NO_CACHING
+    resp["Capabilities"] = 0  # [MS-SMB2] §2.2.10: no share-level caps
+    resp["MaximalAccess"] = 0x001F01FF  # [MS-DTYP] §2.4.3: FILE_ALL_ACCESS
     handler.send_smb2_command(resp.getData(), packet)
 
 
@@ -555,7 +564,11 @@ def smb1_negotiate_protocol(handler: "SMBHandler", packet: smb.NewSMBPacket) -> 
             if "SMB 2.???" in smb2_entries:
                 smb2_upgrade_target = "SMB 2.???"
             else:
-                smb2_upgrade_target = list(smb2_entries)[-1]
+                # Select greatest dialect by numeric value, not dict order
+                smb2_upgrade_target = max(
+                    smb2_entries,
+                    key=lambda d: SMB2_DIALECT_REV.get(d, 0),
+                )
 
     if smb2_upgrade_target is not None:
         command = smb2_negotiate(handler, SMB2_DIALECT_REV[smb2_upgrade_target])
@@ -583,7 +596,13 @@ def smb1_negotiate_protocol(handler: "SMBHandler", packet: smb.NewSMBPacket) -> 
         # --- Extended security path (NTLMSSP/SPNEGO) ---
         handler.smb1_extended_security = True
 
-        resp["Flags2"] = smb.SMB.FLAGS2_EXTENDED_SECURITY | smb.SMB.FLAGS2_NT_STATUS
+        # [MS-SMB] §2.2.3.1: response Flags2 for extended security negotiate
+        resp["Flags2"] = (
+            smb.SMB.FLAGS2_EXTENDED_SECURITY
+            | smb.SMB.FLAGS2_NT_STATUS
+            | smb.SMB.FLAGS2_UNICODE
+            | smb.SMB.FLAGS2_LONG_NAMES
+        )
 
         _dialects_data = smb.SMBExtended_Security_Data()
         # G7: stable ServerGuid per server instance
@@ -605,7 +624,11 @@ def smb1_negotiate_protocol(handler: "SMBHandler", packet: smb.NewSMBPacket) -> 
         handler.smb1_extended_security = False
         handler.smb1_challenge = cfg.ntlm_challenge
 
-        resp["Flags2"] = smb.SMB.FLAGS2_NT_STATUS
+        # [MS-SMB] §2.2.3.1: response Flags2 for non-extended security
+        # NO FLAGS2_EXTENDED_SECURITY; include UNICODE + LONG_NAMES
+        resp["Flags2"] = (
+            smb.SMB.FLAGS2_NT_STATUS | smb.SMB.FLAGS2_UNICODE | smb.SMB.FLAGS2_LONG_NAMES
+        )
 
         _dialects_parameters = smb.SMBNTLMDialect_Parameters()
         _dialects_data = smb.SMBNTLMDialect_Data()
@@ -1033,6 +1056,7 @@ class SMBHandler(BaseProtoHandler):
         G6: Uid is set from smb1_uid when allocated.
         """
         resp = smb.NewSMBPacket()
+        # [MS-CIFS] §2.2.3.1: SMB_FLAGS_REPLY (0x80) on server responses
         resp["Flags1"] = smb.SMB.FLAGS1_REPLY
 
         # G3: mode-aware Flags2 — [MS-SMB] §2.2.3.1
@@ -1075,8 +1099,9 @@ class SMBHandler(BaseProtoHandler):
         G5: SessionID is set from smb2_session_id when allocated.
         """
         resp = smb2.SMB2Packet()
+        # [MS-SMB2] §2.2.1: SMB2_FLAGS_SERVER_TO_REDIR (0x01) on responses
         resp["Flags"] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
-
+        # [MS-SMB2] §2.2.1: NTSTATUS code
         resp["Status"] = status or nt_errors.STATUS_SUCCESS
 
         if packet is None:
@@ -1085,7 +1110,8 @@ class SMBHandler(BaseProtoHandler):
                 "CreditCharge": 0,
                 "Reserved": 0,
                 "MessageID": 0,
-                "TreeID": 0xFFFF,
+                # [MS-SMB2] §2.2.1: TreeId MUST be 0 for NEGOTIATE
+                "TreeID": 0,
             }
         resp["Command"] = packet["Command"]
         resp["CreditCharge"] = packet["CreditCharge"]
@@ -1216,7 +1242,7 @@ class SMBHandler(BaseProtoHandler):
             self.smb1_uid = secrets.randbelow(0xFFFE) + 1
 
         match token[0]:
-            case 0x60:  # GSSAPI negTokenInit
+            case 0x60:  # [RFC4178] §4.2.1 / [MS-SPNG]: ASN.1 APPLICATION[0]
                 self.log_client("GSSAPI negTokenInit", command_name)
                 try:
                     neg_token = spnego.SPNEGO_NegTokenInit(data=token)
@@ -1241,7 +1267,7 @@ class SMBHandler(BaseProtoHandler):
                     )
                 token = neg_token["MechToken"]
 
-            case 0xA1:  # GSSAPI negTokenResp
+            case 0xA1:  # [RFC4178] §4.2.2 / [MS-SPNG]: ASN.1 CONTEXT[1]
                 self.log_client("GSSAPI negTokenArg", command_name)
                 try:
                     neg_token = spnego.SPNEGO_NegTokenResp(data=token)
@@ -1258,7 +1284,7 @@ class SMBHandler(BaseProtoHandler):
         error_code = cfg.smb_error_code
 
         match token[8]:
-            case 0x01:  # NEGOTIATE_MESSAGE
+            case 0x01:  # [MS-NLMP] §2.2.1.1: NEGOTIATE_MESSAGE
                 negotiate = ntlm.NTLMAuthNegotiate()
                 negotiate.fromString(token)
                 if not is_gssapi:
@@ -1318,15 +1344,16 @@ class SMBHandler(BaseProtoHandler):
                 else:
                     resp = challenge
 
+                # [MS-SMB2] §3.3.5.5.3: auth still in progress
                 error_code = nt_errors.STATUS_MORE_PROCESSING_REQUIRED
 
-            case 0x02:  # CHALLENGE_MESSAGE — shouldn't happen
+            case 0x02:  # [MS-NLMP] §2.2.1.2: CHALLENGE_MESSAGE — unexpected
                 if not is_gssapi:
                     self.log_client("NTLMSSP_CHALLENGE_MESSAGE", command_name)
                 self.logger.debug("NTLM challenge message not supported!")
                 raise BaseProtoHandler.TerminateConnection
 
-            case 0x03:  # AUTHENTICATE_MESSAGE
+            case 0x03:  # [MS-NLMP] §2.2.1.3: AUTHENTICATE_MESSAGE
                 authenticate = ntlm.NTLMAuthChallengeResponse()
                 authenticate.fromString(token)
                 if not is_gssapi:
