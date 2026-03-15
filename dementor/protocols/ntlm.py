@@ -76,9 +76,7 @@ from dementor.config.util import is_true, get_value, BytesValue
 from dementor.db import _HOST_INFO
 from dementor.log.logger import ProtocolLogger, dm_logger
 
-# ===========================================================================
-# Constants
-# ===========================================================================
+# --- Constants ---------------------------------------------------------------
 
 # NTLMv1 NtChallengeResponse and LmChallengeResponse are always exactly
 # 24 bytes (DESL output per §6).  NTLMv2 NtChallengeResponse is always
@@ -115,9 +113,6 @@ NTLM_FILETIME_EPOCH_OFFSET: int = 116_444_736_000_000_000
 # Multiplier converting whole seconds to 100-nanosecond FILETIME ticks.
 NTLM_FILETIME_TICKS_PER_SECOND: int = 10_000_000
 
-# ===========================================================================
-# Transport
-# ===========================================================================
 # Transport affects only how credentials are extracted; it does not change
 # the hash format or the crackable material.
 #
@@ -128,9 +123,6 @@ NTLM_TRANSPORT_RAW: str = "raw"
 NTLM_TRANSPORT_NTLMSSP: str = "ntlmssp"
 NTLM_TRANSPORT_CLEARTEXT: str = "cleartext"
 
-# ===========================================================================
-# Hash Types  (MS-NLMP §3.3)
-# ===========================================================================
 # Classification is based on NT response length and LM response content.
 #
 #  Type        NT len   LM len / content     HC mode  MS-NLMP ref
@@ -153,10 +145,6 @@ NTLM_TRANSPORT_CLEARTEXT: str = "cleartext"
 #   len==24 and LM[8:]==Z(16) is the sole reliable signal; the ESS negotiate
 #   flag is supplementary only. For NTLM_TRANSPORT_RAW there are no flags,
 #   so only the byte structure is checked.
-#
-# =============================================================================
-# Responder → Dementor label mapping
-# =============================================================================
 #
 #  Responder label   Dementor label      Reason
 #  ─────────────── ─────────────────── ────────────────────────────────────────
@@ -237,12 +225,16 @@ _parse_challenge = BytesValue(NTLM_CHALLENGE_LEN)
 
 
 def _parse_ntlm_version(value: str | None) -> bytes:
-    """Parse "major.minor.build" into the 8-byte NTLM VERSION structure.
+    """Parse a version string into the 8-byte NTLM VERSION structure.
 
-    Per [MS-NLMP] §2.2.2.10: ProductMajorVersion(1) + ProductMinorVersion(1)
-    + ProductBuild(2 LE) + Reserved(3 zero) + NTLMRevisionCurrent(1).
+    Per [MS-NLMP] §2.2.2.10: ``ProductMajorVersion(1)`` + ``ProductMinorVersion(1)``
+    + ``ProductBuild(2 LE)`` + ``Reserved(3 zero)`` + ``NTLMRevisionCurrent(1)``.
 
-    "0.0.0" or None returns the all-zero placeholder.
+    :param value: Version string as ``"major.minor.build"`` (e.g. ``"10.0.20348"``
+        for Windows Server 2022), or ``None``/``"0.0.0"`` for the all-zero placeholder
+    :type value: str | None
+    :return: 8-byte VERSION structure ready for the CHALLENGE_MESSAGE
+    :rtype: bytes
     """
     if value is None or str(value).strip() in ("", "0.0.0"):
         return NTLM_VERSION_PLACEHOLDER
@@ -258,8 +250,7 @@ def _parse_ntlm_version(value: str | None) -> bytes:
     )
 
 
-# ===========================================================================
-# Configuration Attributes
+# --- Config ------------------------------------------------------------------
 #
 # Attribute objects define the TOML config file entries and their mapping
 # to SessionConfig fields.  Each Attribute specifies:
@@ -268,7 +259,6 @@ def _parse_ntlm_version(value: str | None) -> bytes:
 #   - A default value
 #   - Whether it is global or per-listener
 #   - A factory function for type conversion
-# ===========================================================================
 
 ATTR_NTLM_CHALLENGE = Attribute(
     "ntlm_challenge",
@@ -350,21 +340,19 @@ ATTR_NTLM_DNS_TREE = Attribute(
 )
 
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
-
-
 def apply_config(session: SessionConfig) -> None:
-    """Apply global NTLM settings from [NTLM] to the session.
+    """Apply global NTLM settings from the ``[NTLM]`` TOML section to the session.
 
-    Reads [NTLM] section values and populates session-level NTLM attributes.
-    Individual protocol server configs inherit these as defaults via ATTR_NTLM_*
-    and can override any of the three options in their own config section.
+    Reads Challenge, DisableExtendedSessionSecurity, and DisableNTLMv2 from
+    the ``[NTLM]`` config section and populates session-level attributes.
+    Individual protocol server configs (SMB, HTTP, etc.) inherit these as
+    defaults via ``ATTR_NTLM_*`` and can override in their own sections.
 
     On any parsing error, safe defaults are kept so startup continues.
 
-    :param SessionConfig session: Session object whose NTLM attributes will be populated
+    :param session: Session object whose ``ntlm_challenge``, ``ntlm_disable_ess``,
+        and ``ntlm_disable_ntlmv2`` attributes will be populated
+    :type session: SessionConfig
     """
     # Safe defaults (session remains valid even if config parsing fails).
     session.ntlm_challenge = secrets.token_bytes(NTLM_CHALLENGE_LEN)
@@ -416,14 +404,12 @@ def apply_config(session: SessionConfig) -> None:
         )
 
 
-# ===========================================================================
-# Wire Encoding Helpers  [MS-NLMP §2.2 and §2.2.2.5]
+# --- Encoding ----------------------------------------------------------------
 #
 # NEGOTIATE_MESSAGE fields: always OEM (Unicode not yet negotiated).
 # CHALLENGE_MESSAGE / AUTHENTICATE_MESSAGE: governed by NegotiateFlags:
 #   NTLMSSP_NEGOTIATE_UNICODE (0x01) → UTF-16LE (no BOM)
 #   NTLM_NEGOTIATE_OEM        (0x02) → cp437 baseline
-# ===========================================================================
 
 
 def NTLM_AUTH_decode_string(
@@ -474,15 +460,11 @@ def NTLM_AUTH_encode_string(string: str | None, negotiate_flags: int) -> bytes:
     return string.encode("cp437", errors="replace")
 
 
-# ===========================================================================
-# Dummy LM Response Filtering  [MS-NLMP §3.3.1]
-#
 # When no LM hash is available (password > 14 chars or NoLMHash policy),
 # the client fills LmChallengeResponse with DESL() of a known dummy input:
 #   1. Z(16) -- 16 null bytes
 #   2. DEFAULT_LM_HASH (AAD3B435B51404EE) -- LMOWFv1("")
 # These values are deterministic and carry no crackable material.
-# ===========================================================================
 
 
 def _compute_dummy_lm_responses(server_challenge: bytes) -> set[bytes]:
@@ -499,9 +481,7 @@ def _compute_dummy_lm_responses(server_challenge: bytes) -> set[bytes]:
     }
 
 
-# ===========================================================================
-# NEGOTIATE_MESSAGE Parsing
-# ===========================================================================
+# --- Extraction --------------------------------------------------------------
 
 
 def NTLM_AUTH_format_host(
@@ -579,9 +559,6 @@ def NTLM_AUTH_format_host(
     return host_info
 
 
-# ===========================================================================
-# Hashcat Format Extraction
-#
 # Output formats validated against hashcat module source code
 # (module_05500.c and module_05600.c):
 #
@@ -611,7 +588,6 @@ def NTLM_AUTH_format_host(
 #   Identity: hashcat applies C toupper() to UserName bytes, then
 #   null-expands to UTF-16LE.  DomainName used as-is.
 #   User/Domain MUST be decoded plain-text strings, NOT raw hex bytes.
-# ===========================================================================
 
 
 def NTLM_AUTH_to_hashcat_formats(
@@ -835,9 +811,7 @@ def NTLM_AUTH_to_hashcat_formats(
     return captures
 
 
-# ===========================================================================
-# Timestamp and FQDN Helpers
-# ===========================================================================
+# --- Utilities ---------------------------------------------------------------
 
 
 def NTLM_new_timestamp() -> int:
@@ -868,11 +842,6 @@ def NTLM_split_fqdn(fqdn: str) -> tuple[str, str]:
         hostname, domain = fqdn.split(".", 1)
         return (hostname, domain)
     return (fqdn, "WORKGROUP")
-
-
-# ===========================================================================
-# Anonymous Authentication Detection  [MS-NLMP section 3.2.5.1.2]
-# ===========================================================================
 
 
 def NTLM_AUTH_is_anonymous(token: ntlm.NTLMAuthChallengeResponse) -> bool:
@@ -916,8 +885,7 @@ def NTLM_AUTH_is_anonymous(token: ntlm.NTLMAuthChallengeResponse) -> bool:
         return False
 
 
-# ===========================================================================
-# CHALLENGE_MESSAGE Construction  [MS-NLMP section 2.2.1.2]
+# --- Challenge ---------------------------------------------------------------
 #
 # Dementor controls this message entirely.  The two boolean parameters
 # (disable_ess, disable_ntlmv2) steer which authentication protocol the
@@ -928,7 +896,6 @@ def NTLM_AUTH_is_anonymous(token: ntlm.NTLMAuthChallengeResponse) -> bool:
 #     clients FAIL authentication
 #   - disable_ess=True     -> strip ESS flag -> pure NTLMv1 (vulnerable to
 #     rainbow tables with a fixed ServerChallenge)
-# ===========================================================================
 
 
 def NTLM_AUTH_CreateChallenge(
@@ -1192,23 +1159,26 @@ def NTLM_AUTH_CreateChallenge(
     return challenge_message
 
 
-# ===========================================================================
-# Capture Reporting -- Session Database Integration
-# ===========================================================================
+# --- Reporting ---------------------------------------------------------------
 
 
 def _log_ntlmv2_blob_info(
     auth_token: ntlm.NTLMAuthChallengeResponse,
     log: ProtocolLogger,
 ) -> None:
-    """Extract and log client-side AV_PAIRs from an NTLMv2 blob (G12).
+    """Extract and log client-side AV_PAIRs from an NTLMv2 response blob.
 
-    The NTLMv2 NtChallengeResponse is NTProofStr(16) + CLIENT_CHALLENGE blob.
+    The NTLMv2 NtChallengeResponse is ``NTProofStr(16)`` + ``CLIENT_CHALLENGE`` blob.
     The blob contains AV_PAIRs that the client copied from the server's
-    CHALLENGE_MESSAGE, plus client-added pairs like MsvAvTargetName (SPN),
-    MsvAvTimestamp, and MsvAvFlags.
+    CHALLENGE_MESSAGE, plus client-added pairs like ``MsvAvTargetName`` (SPN),
+    ``MsvAvTimestamp``, and ``MsvAvFlags``.
 
     Only called when NtChallengeResponse length > 24 (NTLMv2).
+
+    :param auth_token: Parsed AUTHENTICATE_MESSAGE containing the NTLMv2 response
+    :type auth_token: ntlm.NTLMAuthChallengeResponse
+    :param log: Logger instance for output
+    :type log: ProtocolLogger
     """
     try:
         nt_response: bytes = auth_token["ntlm"] or b""
@@ -1338,7 +1308,7 @@ def NTLM_report_auth(
         extras = extras or {}
         extras[_HOST_INFO] = host_info
 
-        # G12: extract NTLMv2 client blob AV_PAIRs for intelligence
+        # Extract NTLMv2 client blob AV_PAIRs for intelligence
         _log_ntlmv2_blob_info(auth_token, log)
 
         for version_label, hashcat_line in all_hashes:
@@ -1374,7 +1344,7 @@ def NTLM_report_raw_fields(
     transport: str = NTLM_TRANSPORT_RAW,
     cleartext_password: str | None = None,
 ) -> None:
-    """Extract and report hashes from raw SMB1 basic-security fields (G4).
+    """Extract and report hashes from raw SMB1 basic-security fields.
 
     For NTLM_TRANSPORT_RAW: classifies LM/NT response bytes and formats
     hashcat lines using the existing pipeline. No NTLMSSP wrapper exists
