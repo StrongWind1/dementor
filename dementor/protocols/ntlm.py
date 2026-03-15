@@ -164,9 +164,12 @@ def NTLM_AUTH_classify(
 ) -> str:
     """Classify the hash type from an AUTHENTICATE_MESSAGE response.
 
-    :param bytes nt_response: The NtChallengeResponse field
-    :param bytes lm_response: The LmChallengeResponse field
-    :param int negotiate_flags: The NegotiateFlags from the message
+    :param nt_response: The NtChallengeResponse field
+    :type nt_response: bytes
+    :param lm_response: The LmChallengeResponse field
+    :type lm_response: bytes
+    :param negotiate_flags: The NegotiateFlags from the message
+    :type negotiate_flags: int
     :return: Classification label (NTLM_V1, NTLM_V1_ESS, NTLM_V2, or NTLM_V2_LM)
     :rtype: str
     """
@@ -419,12 +422,15 @@ def NTLM_AUTH_decode_string(
 ) -> str:
     """Decode an NTLM wire string into a Python str.
 
-    :param bytes|None data: Raw bytes from the NTLM message field
-    :param int negotiate_flags: NegotiateFlags from the message. Determines encoding for
+    :param data: Raw bytes from the NTLM message field
+    :type data: bytes | None
+    :param negotiate_flags: NegotiateFlags from the message. Determines encoding for
         CHALLENGE_MESSAGE and AUTHENTICATE_MESSAGE fields
-    :param bool is_negotiate_oem: If True, forces OEM/ASCII decoding regardless of flags.
+    :type negotiate_flags: int
+    :param is_negotiate_oem: If True, forces OEM/ASCII decoding regardless of flags.
         Set this when decoding fields from a NEGOTIATE_MESSAGE, where Unicode
         negotiation has not yet occurred per [MS-NLMP section 2.2]
+    :type is_negotiate_oem: bool
     :return: Decoded string. Returns "" for None or empty input.
         Malformed bytes are replaced with U+FFFD rather than raising
     :rtype: str
@@ -447,8 +453,10 @@ def NTLM_AUTH_decode_string(
 def NTLM_AUTH_encode_string(string: str | None, negotiate_flags: int) -> bytes:
     """Encode a Python str for inclusion in a CHALLENGE_MESSAGE.
 
-    :param str|None string: The string to encode (server name, domain, etc.)
-    :param int negotiate_flags: NegotiateFlags that determine encoding
+    :param string: The string to encode (server name, domain, etc.)
+    :type string: str | None
+    :param negotiate_flags: NegotiateFlags that determine encoding
+    :type negotiate_flags: int
     :return: UTF-16LE if Unicode is negotiated, cp437 (OEM) otherwise.
         Returns b"" for None or empty input
     :rtype: bytes
@@ -470,7 +478,8 @@ def NTLM_AUTH_encode_string(string: str | None, negotiate_flags: int) -> bytes:
 def _compute_dummy_lm_responses(server_challenge: bytes) -> set[bytes]:
     """Compute the two known dummy LmChallengeResponse values (per §3.3.1).
 
-    :param bytes server_challenge: 8-byte ServerChallenge from the CHALLENGE_MESSAGE
+    :param server_challenge: 8-byte ServerChallenge from the CHALLENGE_MESSAGE
+    :type server_challenge: bytes
     :return: Two 24-byte DESL() outputs for the null and empty-string LM hashes.
         Any LmChallengeResponse matching either contains no crackable material
     :rtype: set of bytes
@@ -493,6 +502,7 @@ def NTLM_AUTH_format_host(
     contain VERSION, host_name, and domain_name fields.
 
     :param token: Parsed NEGOTIATE_MESSAGE or AUTHENTICATE_MESSAGE
+    :type token: ntlm.NTLMAuthChallengeResponse | ntlm.NTLMAuthNegotiate
     :return: "OS [ (name: HOSTNAME) ] [ (domain: DOMAIN) ]" Never raises
     :rtype: str
     """
@@ -603,12 +613,18 @@ def NTLM_AUTH_to_hashcat_formats(
     Returns up to two entries: the primary hash and, for NetNTLMv2, the LMv2
     companion. Callers must check for anonymous auth before invoking.
 
-    :param bytes server_challenge: 8-byte ServerChallenge from the CHALLENGE_MESSAGE Dementor sent
-    :param bytes|str user_name: UserName from the AUTHENTICATE_MESSAGE
-    :param bytes|str domain_name: DomainName from the AUTHENTICATE_MESSAGE
-    :param bytes|None lm_response: LmChallengeResponse from the AUTHENTICATE_MESSAGE
-    :param bytes|None nt_response: NtChallengeResponse from the AUTHENTICATE_MESSAGE
-    :param int negotiate_flags: NegotiateFlags from the NTLM exchange
+    :param server_challenge: 8-byte ServerChallenge from the CHALLENGE_MESSAGE Dementor sent
+    :type server_challenge: bytes
+    :param user_name: UserName from the AUTHENTICATE_MESSAGE
+    :type user_name: bytes | str
+    :param domain_name: DomainName from the AUTHENTICATE_MESSAGE
+    :type domain_name: bytes | str
+    :param lm_response: LmChallengeResponse from the AUTHENTICATE_MESSAGE
+    :type lm_response: bytes | None
+    :param nt_response: NtChallengeResponse from the AUTHENTICATE_MESSAGE
+    :type nt_response: bytes | None
+    :param negotiate_flags: NegotiateFlags from the NTLM exchange
+    :type negotiate_flags: int
     :return: (label, hashcat_line) tuples. Labels: NTLM_V2 ("NetNTLMv2"),
         NTLM_V2_LM ("LMv2"), NTLM_V1_ESS ("NetNTLMv1-ESS"), NTLM_V1 ("NetNTLMv1")
     :rtype: list of (str, str)
@@ -830,7 +846,8 @@ def NTLM_new_timestamp() -> int:
 def NTLM_split_fqdn(fqdn: str) -> tuple[str, str]:
     """Split a fully-qualified domain name into (hostname, domain).
 
-    :param str fqdn: Fully-qualified domain name, e.g. "SERVER1.corp.example.com"
+    :param fqdn: Fully-qualified domain name, e.g. "SERVER1.corp.example.com"
+    :type fqdn: str
     :return: ("SERVER1", "corp.example.com") if dotted, or
         (fqdn, "WORKGROUP") if no dots present, or
         ("WORKGROUP", "WORKGROUP") if empty
@@ -852,7 +869,8 @@ def NTLM_AUTH_is_anonymous(token: ntlm.NTLMAuthChallengeResponse) -> bool:
     empty or Z(1). For capture-first operation, do not trust the anonymous
     flag alone, and do not fail-closed on parsing exceptions.
 
-    :param ntlm.NTLMAuthChallengeResponse token: Parsed AUTHENTICATE_MESSAGE from the client
+    :param token: Parsed AUTHENTICATE_MESSAGE from the client
+    :type token: ntlm.NTLMAuthChallengeResponse
     :return: True if the message is structurally anonymous
     :rtype: bool
     """
@@ -916,22 +934,28 @@ def NTLM_AUTH_CreateChallenge(
 ) -> ntlm.NTLMAuthChallenge:
     """Build a CHALLENGE_MESSAGE from the client's NEGOTIATE_MESSAGE flags.
 
-    :param ntlm.NTLMAuthNegotiate|dict token: Parsed NEGOTIATE_MESSAGE (must have a "flags" key)
-    :param str name: Server NetBIOS computer name — the flat hostname label, e.g.
+    :param token: Parsed NEGOTIATE_MESSAGE (must have a "flags" key)
+    :type token: ntlm.NTLMAuthNegotiate | dict
+    :param name: Server NetBIOS computer name — the flat hostname label, e.g.
         "DEMENTOR" or "SERVER1". Must not contain a dot; callers should
         obtain this from NTLM_split_fqdn
-    :param str domain: Server DNS domain name or "WORKGROUP", e.g. "corp.example.com".
+    :type name: str
+    :param domain: Server DNS domain name or "WORKGROUP", e.g. "corp.example.com".
         A domain-joined machine supplies its full DNS domain; a standalone
         machine supplies "WORKGROUP". Callers should obtain this from
         NTLM_split_fqdn
-    :param bytes challenge: 8-byte ServerChallenge nonce
-    :param bool disable_ess: Strip NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY from the response.
+    :type domain: str
+    :param challenge: 8-byte ServerChallenge nonce
+    :type challenge: bytes
+    :param disable_ess: Strip NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY from the response.
         Produces NTLMv1 instead of NTLMv1-ESS. NTLMv1 with a fixed
         ServerChallenge is vulnerable to rainbow table attacks
-    :param bool disable_ntlmv2: Clear NTLMSSP_NEGOTIATE_TARGET_INFO and omit TargetInfoFields.
+    :type disable_ess: bool
+    :param disable_ntlmv2: Clear NTLMSSP_NEGOTIATE_TARGET_INFO and omit TargetInfoFields.
         Without TargetInfoFields the client cannot construct the NTLMv2
         Blob per [MS-NLMP section 3.3.2]. Level 0-2 clients fall back to
         NTLMv1. Level 3+ clients will FAIL authentication
+    :type disable_ntlmv2: bool
     :return: Serialisable CHALLENGE_MESSAGE ready to send to the client
     :rtype: ntlm.NTLMAuthChallenge
     :raises ValueError: If challenge is not exactly 8 bytes
@@ -1245,13 +1269,20 @@ def NTLM_report_auth(
     Extracts every valid hashcat line (NetNTLMv2 + LMv2, or NetNTLMv1/NetNTLMv1-ESS)
     and writes each as a separate entry to the session capture database.
 
-    :param ntlm.NTLMAuthChallengeResponse auth_token: Parsed AUTHENTICATE_MESSAGE
-    :param bytes challenge: 8-byte ServerChallenge from the CHALLENGE_MESSAGE Dementor sent
-    :param tuple[str, int] client: Client connection context (passed through to db.add_auth)
-    :param SessionConfig session: Session context with a .db attribute for capture storage
-    :param ProtocolLogger|None logger: Logger for capture output
-    :param dict|None extras: Additional metadata for db.add_auth
-    :param str transport: NTLM transport identifier (NTLM_TRANSPORT_*); used for logging only
+    :param auth_token: Parsed AUTHENTICATE_MESSAGE
+    :type auth_token: ntlm.NTLMAuthChallengeResponse
+    :param challenge: 8-byte ServerChallenge from the CHALLENGE_MESSAGE Dementor sent
+    :type challenge: bytes
+    :param client: Client connection context (passed through to db.add_auth)
+    :type client: tuple[str, int]
+    :param session: Session context with a .db attribute for capture storage
+    :type session: SessionConfig
+    :param logger: Logger for capture output
+    :type logger: ProtocolLogger | None
+    :param extras: Additional metadata for db.add_auth
+    :type extras: dict | None
+    :param transport: NTLM transport identifier (NTLM_TRANSPORT_*); used for logging only
+    :type transport: str
     """
     # Use the protocol logger for session-linked messages; fall back to the
     # module logger when no protocol logger is provided.
@@ -1353,16 +1384,27 @@ def NTLM_report_raw_fields(
     For NTLM_TRANSPORT_CLEARTEXT: stores the raw password directly.
 
     :param user_name: AccountName from SESSION_SETUP_ANDX
+    :type user_name: bytes | str
     :param domain_name: PrimaryDomain from SESSION_SETUP_ANDX
+    :type domain_name: bytes | str
     :param lm_response: OEMPassword (LM response) — None for cleartext
+    :type lm_response: bytes | None
     :param nt_response: UnicodePassword (NT response) — None for cleartext
+    :type nt_response: bytes | None
     :param challenge: 8-byte server challenge from negotiate
+    :type challenge: bytes
     :param client: (host, port) tuple
+    :type client: tuple[str, int]
     :param session: Session context with .db
+    :type session: SessionConfig
     :param logger: Protocol logger
+    :type logger: ProtocolLogger | None
     :param extras: Additional metadata
+    :type extras: dict[str, Any] | None
     :param transport: NTLM_TRANSPORT_RAW or NTLM_TRANSPORT_CLEARTEXT
+    :type transport: str
     :param cleartext_password: Raw password for cleartext transport
+    :type cleartext_password: str | None
     """
     log = logger or dm_logger
 

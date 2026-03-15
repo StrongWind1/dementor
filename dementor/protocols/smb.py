@@ -160,6 +160,15 @@ def parse_dialect(value: str | int) -> int:
 
 
 class SMBServerConfig(TomlConfig):
+    """Per-listener SMB server configuration loaded from TOML.
+
+    Each ``[[SMB.Server]]`` entry in ``Dementor.toml`` produces one instance.
+    Inherits shared NTLM settings (Challenge, DisableESS, DisableNTLMv2, and
+    identity overrides) from the ``[NTLM]`` section via ``ATTR_NTLM_*``
+    attributes with ``section_local=False``, enabling 4-level config resolution:
+    per-server → ``[SMB]`` → ``[NTLM]`` → ``[Globals]``.
+    """
+
     _section_ = "SMB"
     _fields_ = [
         # --- Transport & Protocol ---
@@ -314,6 +323,18 @@ def get_command_name(command: int, smb_version: int) -> str:
 
 # --- Handler -----------------------------------------------------------------
 class SMBHandler(BaseProtoHandler):
+    """Per-connection SMB protocol handler for NTLM credential capture.
+
+    Implements both SMB1 and SMB2/3 protocol paths as an auth-capture scaffold:
+    negotiates the protocol, runs the NTLMSSP exchange to extract crackable
+    hashes, optionally retries for multi-credential capture, then drops the
+    connection. Supports extended security (SPNEGO/NTLMSSP), basic security
+    (raw challenge/response), and cleartext password capture.
+
+    Command dispatch is table-driven via :attr:`smb1_commands` and
+    :attr:`smb2_commands` dicts populated in :meth:`__init__`.
+    """
+
     STATE_NEGOTIATE = 0
     STATE_AUTH = 1
 
@@ -1770,6 +1791,13 @@ class SMBHandler(BaseProtoHandler):
 
 # --- Server ------------------------------------------------------------------
 class SMBServer(ThreadingTCPServer):
+    """Threaded TCP server that spawns an :class:`SMBHandler` per connection.
+
+    Generates a stable 16-byte ``ServerGuid`` per [MS-SMB2] §2.2.4 that
+    persists for the lifetime of this server instance (shared across all
+    connections handled by this listener).
+    """
+
     default_handler_class = SMBHandler
     default_port = 445
 
