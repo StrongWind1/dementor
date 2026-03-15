@@ -251,33 +251,97 @@ AllowedQueryTypes = ["A", "AAAA", "ALL"]
 # =============================================================================
 [SMB]
 
-# The name that will be used to identify the SMB server when responding to client
-# queries.
+# --- Transport & Protocol ---
 
-# FQDN = "name.domain.com"
+# Accept SMB1 connections (0xFF header byte). When false, all SMB1 is rejected.
+# The default value is: true
 
-# The operating system reported by the SMB server. This helps identify the type
-# of server responding.
+EnableSMB1 = true
 
-# ServerOS = "UNIX"
+# Accept SMB2/3 connections (0xFE header byte). When false, all SMB2 is rejected.
+# The default value is: true
 
-# Enables SMB2 protocol support. Requests made with SMB1 will be upgraded automatically
-# to SMB2.
+EnableSMB2 = true
 
-SMB2Support = true
+# Allow SMB1→SMB2 protocol transition when clients offer SMB2 dialect strings
+# ("SMB 2.???", "SMB 2.002") in an SMB1 NEGOTIATE. Replaces old "SMB2Support".
+# The default value is: true
 
-# Error code to return when access is denied. You can specify NT_STATUS values or
-# string equivalents (e.g., "STATUS_ACCESS_DENIED").
+AllowSMB1Upgrade = true
+
+# Floor and ceiling for SMB2 dialect negotiation. Clients offering only dialects
+# outside this range get STATUS_NOT_SUPPORTED.
+# Valid values: "2.002", "2.1", "3.0", "3.0.2", "3.1.1"
+
+# SMB2MinDialect = "2.002"
+# SMB2MaxDialect = "3.1.1"
+
+# --- SMB Negotiate ---
+
+# When true, clears NEGOTIATE_ENCRYPT_PASSWORDS in SMB1 non-extended negotiate.
+# ChallengeLength becomes 0 and clients send cleartext passwords instead of hashes.
+# WARNING: All Windows NT4 SP3+ / 2000+ refuse plaintext by default. Only useful
+# for targeting legacy (NT4 base/SP2), misconfigured, or embedded/IoT clients.
+# Only affects SMB1 non-extended security. No effect on SMB1 extended or SMB2.
+# The default value is: false
+
+ForceSMB1Plaintext = false
+
+# --- SMB Identity ---
+
+# NetBIOS computer name — appears in SMB1 negotiate (non-extended path) and
+# defaults NTLM.NetBIOSComputer for CHALLENGE_MESSAGE AV_PAIRs.
+
+NetBIOSComputer = "DEMENTOR"
+
+# NetBIOS domain name — appears in SMB1 negotiate (non-extended path) and
+# defaults NTLM.NetBIOSDomain for CHALLENGE_MESSAGE AV_PAIRs.
+
+NetBIOSDomain = "WORKGROUP"
+
+# NativeOS string in SMB1 SESSION_SETUP response. SMB2 does not send this.
+
+# ServerOS = "Windows"
+
+# NativeLanMan string in SMB1 SESSION_SETUP response. Defaults to ServerOS.
+
+# NativeLanMan = "Windows"
+
+# --- Post-Auth ---
+
+# Number of credential captures per connection. After each capture except the
+# last, sends STATUS_ACCOUNT_DISABLED (0xC0000072) to trigger SSPI retry with
+# alternate cached credentials. Set to 1 to disable multi-credential capture.
+# The default value is: 2
+
+CapturesPerConnection = 2
+
+# NTSTATUS error code returned after the final credential capture.
 
 ErrorCode = "STATUS_SMB_BAD_UID"
 
-# NTLM settings: Challenge, DisableExtendedSessionSecurity, DisableNTLMv2
+# --- NTLM settings ---
+# Challenge, DisableExtendedSessionSecurity, DisableNTLMv2:
 #   Not set here → falls back to [NTLM]. Set here to override [NTLM] for all
 #   SMB servers, or inside [[SMB.Server]] to override for a single server only.
 
 # Challenge = "1337LEET"
 # DisableExtendedSessionSecurity = false
 # DisableNTLMv2 = false
+
+# --- NTLM Identity ---
+# These control server identity inside the NTLMSSP CHALLENGE_MESSAGE AV_PAIRs.
+# When not set, they default to the SMB identity values above.
+# Set here to override for all SMB servers, or use the [NTLM] section for all
+# NTLM-enabled protocols.
+
+# NTLM.TargetType = "server"         # "server" or "domain"
+# NTLM.Version = "0.0.0"             # e.g. "10.0.20348" for Server 2022
+# NTLM.NetBIOSComputer = "DEMENTOR"  # AV_PAIR 0x0001
+# NTLM.NetBIOSDomain = "WORKGROUP"   # AV_PAIR 0x0002
+# NTLM.DnsComputer = "dementor.workgroup"  # AV_PAIR 0x0003
+# NTLM.DnsDomain = "workgroup"       # AV_PAIR 0x0004
+# NTLM.DnsTree = "workgroup"         # AV_PAIR 0x0005
 
 # You can define multiple SMB server instances to listen on different ports or use
 # different configurations.
@@ -287,10 +351,11 @@ Port = 139
 [[SMB.Server]]
 Port = 445
 # Per-server overrides (highest priority — override [SMB] and [NTLM] for this port only):
-# FQDN = "other.corp.com"
+# NetBIOSComputer = "FILESRV01"
+# NetBIOSDomain = "CORP"
 # ServerOS = "Windows Server 2022"
 # ErrorCode = "STATUS_ACCESS_DENIED"
-# SMB2Support = true
+# CapturesPerConnection = 1
 # Challenge = "hex:aabbccddeeff0011"
 # DisableExtendedSessionSecurity = false
 # DisableNTLMv2 = false
@@ -409,6 +474,29 @@ DisableExtendedSessionSecurity = false
 # Leave false unless specifically targeting legacy NTLMv1-only environments.
 
 DisableNTLMv2 = false
+
+# --- NTLM Identity (CHALLENGE_MESSAGE AV_PAIRs) ---
+# These control the server identity inside all NTLMSSP CHALLENGE_MESSAGEs.
+# When not set here, protocol-specific values are used (e.g., SMB.NetBIOSComputer).
+# Set here to apply the same identity across all NTLM-enabled protocols.
+
+# "server" = NTLMSSP_TARGET_TYPE_SERVER (standalone)
+# "domain" = NTLMSSP_TARGET_TYPE_DOMAIN (mimics a domain controller)
+# TargetType = "server"
+
+# VERSION structure: "major.minor.build" (e.g. "10.0.20348" for Server 2022).
+# "0.0.0" = all-zero placeholder (spec-correct but detectable).
+# Version = "0.0.0"
+
+# Individual AV_PAIR overrides — only set these if all protocols should share
+# the same NTLM identity (rare). More commonly, each protocol section sets
+# its own identity and these inherit from there.
+
+# NetBIOSComputer = "DEMENTOR"  # MsvAvNbComputerName (0x0001)
+# NetBIOSDomain = "WORKGROUP"   # MsvAvNbDomainName (0x0002)
+# DnsComputer = "dementor.workgroup"  # MsvAvDnsComputerName (0x0003)
+# DnsDomain = "workgroup"       # MsvAvDnsDomainName (0x0004)
+# DnsTree = "workgroup"         # MsvAvDnsTreeName (0x0005)
 
 # =============================================================================
 # FTP Server(s)

