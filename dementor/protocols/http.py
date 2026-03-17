@@ -46,11 +46,11 @@ from dementor.servers import ServerThread, bind_server, BaseServerThread
 from dementor.db import _CLEARTEXT, normalize_client_address, _NO_USER
 from dementor.paths import HTTP_TEMPLATES_PATH
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
+    NTLM_build_challenge_message,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
     ATTR_NTLM_DISABLE_NTLMV2,
-    NTLM_report_auth,
+    NTLM_handle_authenticate_message,
     NTLM_split_fqdn,
 )
 
@@ -444,7 +444,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         match message:
             case ntlm.NTLM_HTTP_AuthNegotiate():
                 self.display_request("NTLMSSP_NEGOTIATE", logger)
-                challenge = NTLM_AUTH_CreateChallenge(
+                challenge = NTLM_build_challenge_message(
                     message,
                     *NTLM_split_fqdn(self.config.http_fqdn),
                     challenge=self.config.ntlm_challenge,
@@ -460,7 +460,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
             case ntlm.NTLM_HTTP_AuthChallengeResponse():
                 self.display_request("NTLMSSP_AUTH", logger)
-                NTLM_report_auth(
+                NTLM_handle_authenticate_message(
                     message,
                     challenge=self.config.ntlm_challenge,
                     client=self.client_address,

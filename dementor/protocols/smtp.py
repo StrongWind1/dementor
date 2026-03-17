@@ -50,8 +50,8 @@ from dementor.config.toml import TomlConfig, Attribute as A
 from dementor.config.session import SessionConfig
 from dementor.log.logger import ProtocolLogger, dm_logger
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
-    NTLM_report_auth,
+    NTLM_build_challenge_message,
+    NTLM_handle_authenticate_message,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
     ATTR_NTLM_DISABLE_NTLMV2,
@@ -250,7 +250,7 @@ class SMTPServerHandler:
             name, domain = self.server_config.smtp_fqdn, ""
 
         # now we can build the challenge using the answer flags
-        ntlm_challenge = NTLM_AUTH_CreateChallenge(
+        ntlm_challenge = NTLM_build_challenge_message(
             negotiate_message,
             name,
             domain,
@@ -267,7 +267,7 @@ class SMTPServerHandler:
         # NTLM AUTHENTICATE_MESSAGE.
         auth_message = NTLMAuthChallengeResponse()
         auth_message.fromString(blob)
-        NTLM_report_auth(
+        NTLM_handle_authenticate_message(
             auth_message,
             self.server_config.ntlm_challenge,
             server.session.peer,

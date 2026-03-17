@@ -52,13 +52,13 @@ from dementor.config.util import is_true
 from dementor.loader import BaseProtocolModule, DEFAULT_ATTR
 from dementor.log.logger import ProtocolLogger, dm_logger
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
-    NTLM_AUTH_extract_client_fields,
+    NTLM_build_challenge_message,
     NTLM_TRANSPORT_CLEARTEXT,
     NTLM_TRANSPORT_RAW,
-    NTLM_new_timestamp,
-    NTLM_report_auth,
-    NTLM_report_raw_fields,
+    NTLM_handle_negotiate_message,
+    NTLM_timestamp,
+    NTLM_handle_authenticate_message,
+    NTLM_handle_legacy_raw_auth,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
     ATTR_NTLM_DISABLE_NTLMV2,
@@ -341,7 +341,7 @@ def get_server_time() -> int:
     :return: Current UTC time encoded as a 64-bit Windows FILETIME value
     :rtype: int
     """
-    return NTLM_new_timestamp()
+    return NTLM_timestamp()
 
 
 def get_command_name(command: int, smb_version: int) -> str:
@@ -443,6 +443,11 @@ class SMBHandler(BaseProtoHandler):
         # Accumulated client info from all messages (NEGOTIATE, SESSION_SETUP,
         # AUTHENTICATE). Emitted as a single display line after auth completes.
         self.client_info: dict[str, str] = {}
+        # NTLM NEGOTIATE fields returned by NTLM_handle_negotiate_message().
+        # Passed back to NTLM_handle_authenticate_message() so the display line is the
+        # deduped union of Type 1 + Type 3.  This is ntlm.py's own output
+        # passed through — smb.py never reads or modifies it.
+        self.ntlm_negotiate_fields: dict[str, str] = {}
 
         self.smb1_commands: dict[int, typing.Any] = {
             smb.SMB.SMB_COM_NEGOTIATE: self.handle_smb1_negotiate,
@@ -638,7 +643,7 @@ class SMBHandler(BaseProtoHandler):
 
             packet = nmb.NetBIOSSessionPacket(data)
             if packet.get_type() == nmb.NETBIOS_SESSION_KEEP_ALIVE:
-                self.logger.debug("<NETBIOS_SESSION_KEEP_ALIVE>", is_client=True)
+                self.logger.debug("C: <NETBIOS_SESSION_KEEP_ALIVE>")
                 continue
 
             if packet.get_type() == nmb.NETBIOS_SESSION_REQUEST:
@@ -651,14 +656,17 @@ class SMBHandler(BaseProtoHandler):
                     calling_name = field.m2i(None, b"\x20" + caller[:-2]).decode(
                         errors="replace"
                     )
+                    cn = calling_name.rstrip()
+                    cdn = called_name.rstrip()
                     self.logger.debug(
-                        f"<NETBIOS_SESSION_REQUEST> {calling_name} -> {called_name}",
-                        is_client=True,
+                        f"C: NETBIOS_SESSION_REQUEST: "
+                        f"CallingName={cn or '(empty)'} "
+                        f"CalledName={cdn or '(empty)'}",
                     )
-                    if calling_name:
-                        self.client_info["calling"] = calling_name.rstrip()
-                    if called_name:
-                        self.client_info["called"] = called_name.rstrip()
+                    if cn:
+                        self.client_info["smb_calling_name"] = cn
+                    if cdn:
+                        self.client_info["smb_called_name"] = cdn
                 except ValueError:
                     pass
                 self.send_data(b"\x00", nmb.NETBIOS_SESSION_POSITIVE_RESPONSE)
@@ -731,63 +739,18 @@ class SMBHandler(BaseProtoHandler):
         keys = [
             ("smb_os", "os"),
             ("smb_lanman", "lanman"),
-            ("calling", "calling"),
-            ("called", "called"),
-            ("account", "account"),
+            ("smb_calling_name", "calling"),
+            ("smb_called_name", "called"),
+            ("smb_account", "account"),
             ("smb_domain", "domain"),
-            ("path", "path"),
+            ("smb_path", "path"),
+            ("smb_dialect", "dialect"),
         ]
         parts = [
             f"{label}:{self.client_info[k]}" for k, label in keys if k in self.client_info
         ]
         if parts:
             self.logger.display(f"SMB: {' | '.join(parts)}")
-
-    def log_client(self, msg: str, command: str | None = None) -> None:
-        """Log a debug message attributed to the client.
-
-        :param msg: The message text to log
-        :type msg: str
-        :param command: Optional command name to prefix the message with, defaults to None
-        :type command: str | None, optional
-        """
-        self.log(msg, command, is_client=True)
-
-    def log_server(self, msg: str, command: str | None = None) -> None:
-        """Log a debug message attributed to the server.
-
-        :param msg: The message text to log
-        :type msg: str
-        :param command: Optional command name to prefix the message with, defaults to None
-        :type command: str | None, optional
-        """
-        self.log(msg, command, is_server=True)
-
-    def log(
-        self,
-        msg: str,
-        command: str | None = None,
-        is_server: bool = False,
-        is_client: bool = False,
-    ) -> None:
-        """Log a debug message with optional command prefix and direction tag.
-
-        When *command* is provided, the message is prefixed with
-        ``<command> ``. The *is_server* and *is_client* flags control
-        the directional tag in the log output.
-
-        :param msg: The message text to log
-        :type msg: str
-        :param command: Optional command name to prefix the message with, defaults to None
-        :type command: str | None, optional
-        :param is_server: Tag this message as server-originated, defaults to False
-        :type is_server: bool, optional
-        :param is_client: Tag this message as client-originated, defaults to False
-        :type is_client: bool, optional
-        """
-        if command:
-            msg = f"<{command}> {msg}"
-        self.logger.debug(msg, is_server=is_server, is_client=is_client)
 
     # -- NTLMSSP exchange --
 
@@ -837,7 +800,7 @@ class SMBHandler(BaseProtoHandler):
 
         match token[0]:
             case 0x60:  # [RFC4178] §4.2.1 / [MS-SPNG]: ASN.1 APPLICATION[0]
-                self.log_client("GSSAPI negTokenInit", command_name)
+                self.logger.debug(f"C: <{command_name}> GSSAPI negTokenInit")
                 try:
                     neg_token = spnego.SPNEGO_NegTokenInit(data=token)
                 except Exception as e:
@@ -862,7 +825,7 @@ class SMBHandler(BaseProtoHandler):
                 token = neg_token["MechToken"]
 
             case 0xA1:  # [RFC4178] §4.2.2 / [MS-SPNG]: ASN.1 CONTEXT[1]
-                self.log_client("GSSAPI negTokenArg", command_name)
+                self.logger.debug(f"C: <{command_name}> GSSAPI negTokenArg")
                 try:
                     neg_token = spnego.SPNEGO_NegTokenResp(data=token)
                 except Exception as e:
@@ -882,22 +845,15 @@ class SMBHandler(BaseProtoHandler):
                 negotiate = ntlm.NTLMAuthNegotiate()
                 negotiate.fromString(token)
                 if not is_gssapi:
-                    self.log_client("NTLMSSP_NEGOTIATE_MESSAGE", command_name)
+                    self.logger.debug(f"C: <{command_name}> NTLMSSP_NEGOTIATE_MESSAGE")
 
-                # Accumulate client info from NEGOTIATE for consolidated display
-                try:
-                    self.client_info.update(
-                        NTLM_AUTH_extract_client_fields(negotiate, is_negotiate=True)
-                    )
-                    client_flags: int = negotiate["flags"]
-                    self.logger.debug(
-                        f"<{command_name}> NTLMSSP NegotiateFlags: 0x{client_flags:08x}",
-                        is_client=True,
-                    )
-                except Exception:
-                    self.logger.debug(
-                        "Failed to extract NTLMSSP negotiate client info",
-                    )
+                # NTLM-layer NEGOTIATE parsing and logging stays in ntlm.py.
+                # Store the returned dict to pass through to NTLM_handle_authenticate_message
+                # for the deduped display line.  Do NOT merge into client_info
+                # — the SMB display line uses only SMB-layer fields.
+                self.ntlm_negotiate_fields = NTLM_handle_negotiate_message(
+                    negotiate, self.logger
+                )
 
                 # Resolve NTLM identity: NTLM overrides → SMB defaults
                 nb_computer = cfg.ntlm_nb_computer or cfg.smb_nb_computer
@@ -910,7 +866,7 @@ class SMBHandler(BaseProtoHandler):
                 )
                 dns_tree = cfg.ntlm_dns_tree
 
-                challenge = NTLM_AUTH_CreateChallenge(
+                challenge = NTLM_build_challenge_message(
                     negotiate,
                     nb_computer,
                     dns_domain,
@@ -925,7 +881,7 @@ class SMBHandler(BaseProtoHandler):
                     dns_domain=dns_domain,
                     dns_tree=dns_tree,
                 )
-                self.log_server("NTLMSSP_CHALLENGE_MESSAGE", command_name)
+                self.logger.debug(f"S: <{command_name}> NTLMSSP_CHALLENGE_MESSAGE")
                 if is_gssapi:
                     resp = build_neg_token_resp(
                         NEG_STATE_ACCEPT_INCOMPLETE,
@@ -940,7 +896,7 @@ class SMBHandler(BaseProtoHandler):
 
             case 0x02:  # [MS-NLMP] §2.2.1.2: CHALLENGE_MESSAGE — unexpected
                 if not is_gssapi:
-                    self.log_client("NTLMSSP_CHALLENGE_MESSAGE", command_name)
+                    self.logger.debug(f"C: <{command_name}> NTLMSSP_CHALLENGE_MESSAGE")
                 self.logger.debug("NTLM challenge message not supported!")
                 raise BaseProtoHandler.TerminateConnection
 
@@ -948,42 +904,33 @@ class SMBHandler(BaseProtoHandler):
                 authenticate = ntlm.NTLMAuthChallengeResponse()
                 authenticate.fromString(token)
                 if not is_gssapi:
-                    self.log_client("NTLMSSP_AUTHENTICATE_MESSAGE", command_name)
+                    self.logger.debug(f"C: <{command_name}> NTLMSSP_AUTHENTICATE_MESSAGE")
 
-                # Log the final negotiated NTLMSSP flags
-                try:
-                    auth_flags: int = authenticate["flags"]
-                    self.logger.debug(
-                        f"<{command_name}> NTLMSSP final flags: 0x{auth_flags:08x}",
-                        is_client=True,
-                    )
-                except Exception:
-                    self.logger.debug(
-                        "Failed to extract NTLMSSP auth flags",
-                    )
-
-                NTLM_report_auth(
+                # NTLM-layer AUTHENTICATE parsing and logging in ntlm.py
+                NTLM_handle_authenticate_message(
                     authenticate,
                     challenge=cfg.ntlm_challenge,
                     client=self.client_address,
                     session=self.config,
                     logger=self.logger,
-                    negotiate_info=self.client_info,
+                    negotiate_fields=self.ntlm_negotiate_fields,
                 )
 
                 # Multi-credential capture: returns STATUS_ACCOUNT_DISABLED or final error
-                error_code = self.resolve_auth_error_code()
+                error_code = self._resolve_auth_error_code()
                 resp = build_neg_token_resp(NEG_STATE_REJECT)
 
             case message_type:
-                self.log_client(f"NTLMSSP: unknown {message_type:02x}", command_name)
+                self.logger.debug(
+                    f"C: <{command_name}> NTLMSSP: unknown {message_type:02x}"
+                )
                 raise BaseProtoHandler.TerminateConnection
 
         return resp.getData(), error_code
 
     # -- Multi-credential capture --
 
-    def resolve_auth_error_code(self) -> int:
+    def _resolve_auth_error_code(self) -> int:
         """Determine the NTSTATUS error code for the current auth attempt.
 
         Windows SSPI retries authentication with alternate cached
@@ -1009,7 +956,7 @@ class SMBHandler(BaseProtoHandler):
 
     # -- SMB2 command handlers --
 
-    def smb3_neg_context_pad(self, data_len: int) -> bytes:
+    def _smb3_neg_context_pad(self, data_len: int) -> bytes:
         """Compute padding bytes for 8-byte alignment of negotiate contexts.
 
         [MS-SMB2] §2.2.4: padding between negotiate contexts for 8-byte
@@ -1022,7 +969,7 @@ class SMBHandler(BaseProtoHandler):
         """
         return b"\x00" * ((8 - (data_len % 8)) % 8)
 
-    def smb3_build_neg_context_list(
+    def _smb3_build_neg_context_list(
         self,
         context_objects: list[tuple[int, bytes]],
     ) -> bytes:
@@ -1046,10 +993,10 @@ class SMBHandler(BaseProtoHandler):
             context["DataLength"] = len(caps)
 
             context_list += context.getData()
-            context_list += self.smb3_neg_context_pad(context["DataLength"])
+            context_list += self._smb3_neg_context_pad(context["DataLength"])
         return context_list
 
-    def smb3_get_target_capabilities(
+    def _smb3_get_target_capabilities(
         self, request: smb2.SMB2Negotiate
     ) -> tuple[int, ...]:
         """Extract client's preferred encryption and signing from 3.1.1 contexts.
@@ -1093,7 +1040,7 @@ class SMBHandler(BaseProtoHandler):
             self.logger.debug(f"Warning: invalid negotiate context list: {e}")
         return target_cipher, target_sign
 
-    def build_smb2_negotiate_response(
+    def _build_smb2_negotiate_response(
         self,
         target_revision: int,
         request: smb2.SMB2Negotiate | None = None,
@@ -1150,7 +1097,7 @@ class SMBHandler(BaseProtoHandler):
             target_cipher = smb3.SMB2_ENCRYPTION_AES128_GCM
             target_sign = 0x001  # [MS-SMB2] §2.2.3.1.7: AES-CMAC signing algorithm
             if request:
-                target_cipher, target_sign = self.smb3_get_target_capabilities(request)
+                target_cipher, target_sign = self._smb3_get_target_capabilities(request)
 
             enc_caps = smb3.SMB2EncryptionCapabilities()
             enc_caps["CipherCount"] = 1
@@ -1161,7 +1108,7 @@ class SMBHandler(BaseProtoHandler):
                 SigningAlgorithmCount=1, SigningAlgorithms=[target_sign]
             )
 
-            context_data = self.smb3_build_neg_context_list(
+            context_data = self._smb3_build_neg_context_list(
                 [
                     (
                         smb3.SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
@@ -1176,7 +1123,7 @@ class SMBHandler(BaseProtoHandler):
             )
 
             offset: int = 0x80 + command["SecurityBufferLength"]
-            sec_buf_pad = self.smb3_neg_context_pad(
+            sec_buf_pad = self._smb3_neg_context_pad(
                 0x80 + command["SecurityBufferLength"]
             )
             command["NegotiateContextOffset"] = offset + len(sec_buf_pad)
@@ -1211,33 +1158,25 @@ class SMBHandler(BaseProtoHandler):
         req_dialects: list[int] = req_raw_dialects[:dialect_count]
         if len(req_dialects) == 0:
             # [MS-SMB2] §3.3.5.4: DialectCount == 0 → STATUS_INVALID_PARAMETER
-            self.log_client("Client sent no dialects", "SMB2_NEGOTIATE")
+            self.logger.debug("C: <SMB2_NEGOTIATE> Client sent no dialects")
             self.logger.fail("SMB Negotiation: Client failed to provide any dialects.")
             raise BaseProtoHandler.TerminateConnection
 
         str_req_dialects = ", ".join([SMB2_DIALECTS.get(d, hex(d)) for d in req_dialects])
-        guid = uuid.UUID(bytes_le=req["ClientGuid"])
-        self.log_client(
-            f"requested dialects: {str_req_dialects} (client: {guid})",
-            "SMB2_NEGOTIATE",
-        )
 
-        # Extract client SecurityMode and Capabilities — [MS-SMB2] §2.2.3
+        # Build ONE consolidated debug line — [MS-SMB2] §2.2.3
         try:
+            guid = uuid.UUID(bytes_le=req["ClientGuid"])
             sec_mode: int = req["SecurityMode"]
             client_caps: int = req["Capabilities"]
-            self.logger.debug(
-                f"<SMB2_NEGOTIATE> Client SecurityMode=0x{sec_mode:04x} "
-                f"Capabilities=0x{client_caps:08x}",
-                is_client=True,
-            )
-        except Exception:
-            self.logger.debug(
-                "Failed to extract SMB2 negotiate client info",
+            debug_parts = (
+                f"SMB2_NEGOTIATE: Dialects={str_req_dialects} "
+                f"ClientGuid={guid} "
+                f"SecurityMode=0x{sec_mode:04x} "
+                f"Capabilities=0x{client_caps:08x}"
             )
 
-        # SMB 3.1.1 NegotiateContextList — [MS-SMB2] §2.2.3.1
-        try:
+            # Add NegotiateContexts only for 3.1.1 — [MS-SMB2] §2.2.3.1
             ctx_data: bytes = req["NegotiateContextList"] or b""
             if ctx_data:
                 ctx_types = {
@@ -1252,16 +1191,16 @@ class SMBHandler(BaseProtoHandler):
                     ct: int = ctx["ContextType"]
                     dl: int = ctx["DataLength"]
                     names.append(ctx_types.get(ct, f"0x{ct:04x}"))
-                    # Advance past header (8) + data + 8-byte alignment padding
                     offset += 8 + dl
                     offset += (8 - (offset % 8)) % 8
                 if names:
-                    self.logger.debug(
-                        f"<SMB2_NEGOTIATE> NegotiateContexts: {', '.join(names)}",
-                        is_client=True,
-                    )
+                    debug_parts += f" NegotiateContexts={', '.join(names)}"
+
+            self.logger.debug(f"C: {debug_parts}")
         except Exception:
-            self.logger.debug("Failed to parse SMB2 NegotiateContextList")
+            self.logger.debug(
+                f"C: SMB2_NEGOTIATE: Dialects={str_req_dialects}",
+            )
 
         # Select greatest common dialect within configured min/max range
         cfg = self.smb_config
@@ -1285,10 +1224,10 @@ class SMBHandler(BaseProtoHandler):
             )
             raise BaseProtoHandler.TerminateConnection
 
-        command = self.build_smb2_negotiate_response(dialect, req)
-        self.log_server(
-            f"selected dialect: {SMB2_DIALECTS.get(dialect, hex(dialect))}",
-            "SMB2_NEGOTIATE",
+        command = self._build_smb2_negotiate_response(dialect, req)
+        self.client_info["smb_dialect"] = SMB2_DIALECTS.get(dialect, hex(dialect))
+        self.logger.debug(
+            f"S: <SMB2_NEGOTIATE> selected dialect: {SMB2_DIALECTS.get(dialect, hex(dialect))}",
         )
         self.send_smb2_command(command.getData())
 
@@ -1308,15 +1247,13 @@ class SMBHandler(BaseProtoHandler):
         """
         req = smb2.SMB2SessionSetup(data=packet["Data"])
 
-        # Log PreviousSessionId — nonzero indicates session reconnection
+        # Log PreviousSessionId — [MS-SMB2] §2.2.5
         try:
             prev_session: int = req["PreviousSessionId"]
-            if prev_session:
-                self.logger.debug(
-                    f"<SMB2_SESSION_SETUP> Reconnecting "
-                    f"(PreviousSessionId=0x{prev_session:016x})",
-                    is_client=True,
-                )
+            prev_str = f"0x{prev_session:016x}" if prev_session else "(empty)"
+            self.logger.debug(
+                f"C: SMB2_SESSION_SETUP: PreviousSessionId={prev_str}",
+            )
         except Exception:
             self.logger.debug("Failed to extract PreviousSessionId", exc_info=True)
 
@@ -1345,7 +1282,7 @@ class SMBHandler(BaseProtoHandler):
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
         """
-        self.log_client("Client requested logoff", "SMB2_LOGOFF")
+        self.logger.debug("C: <SMB2_LOGOFF> Client requested logoff")
 
         response = smb2.SMB2Logoff_Response()
         self.authenticated = False
@@ -1370,13 +1307,12 @@ class SMBHandler(BaseProtoHandler):
             # [MS-SMB2] §2.2.9: PathName is always UTF-16LE in SMB2
             path = path_bytes.decode("utf-16-le", errors="replace")
             self.logger.debug(
-                f"<SMB2_TREE_CONNECT> Tree connect: {path}",
-                is_client=True,
+                f"C: SMB2_TREE_CONNECT: Path={path or '(empty)'}",
             )
             if path:
-                self.client_info["path"] = path
+                self.client_info["smb_path"] = path
         except Exception:
-            self.log_client("Tree connect (malformed)", "SMB2_TREE_CONNECT")
+            self.logger.debug("C: <SMB2_TREE_CONNECT> Tree connect (malformed)")
 
         # [MS-SMB2] §2.2.10: SMB2 TREE_CONNECT Response
         resp = smb2.SMB2TreeConnect_Response()
@@ -1414,7 +1350,7 @@ class SMBHandler(BaseProtoHandler):
         # [MS-CIFS] §2.2.4.52.1: each dialect prefixed by 0x02
         req_data_dialects: list[bytes] = req["Data"].split(b"\x02")[1:]
         if len(req_data_dialects) == 0:
-            self.log_client("Client sent no dialects", "SMB_COM_NEGOTIATE")
+            self.logger.debug("C: <SMB_COM_NEGOTIATE> Client sent no dialects")
             self.logger.fail("SMB Negotiation: Client failed to provide any dialects.")
             raise BaseProtoHandler.TerminateConnection
 
@@ -1422,7 +1358,9 @@ class SMBHandler(BaseProtoHandler):
             dialect.rstrip(b"\x00").decode(errors="replace")
             for dialect in req_data_dialects
         ]
-        self.log_client(f"dialects: {', '.join(dialects)}", "SMB_COM_NEGOTIATE")
+        self.logger.debug(
+            f"C: SMB_COM_NEGOTIATE: Dialects={', '.join(dialects)}",
+        )
 
         cfg = self.smb_config
 
@@ -1447,10 +1385,14 @@ class SMBHandler(BaseProtoHandler):
                     )
 
         if smb2_upgrade_target is not None:
-            command = self.build_smb2_negotiate_response(
+            command = self._build_smb2_negotiate_response(
                 SMB2_DIALECT_REV[smb2_upgrade_target]
             )
-            self.log_server("Switching protocol to SMBv2", "SMB_COM_NEGOTIATE")
+            self.logger.debug("S: <SMB_COM_NEGOTIATE> Switching protocol to SMBv2")
+            upgrade_dialect = SMB2_DIALECT_REV[smb2_upgrade_target]
+            self.client_info["smb_dialect"] = (
+                f"{SMB2_DIALECTS.get(upgrade_dialect, hex(upgrade_dialect))} (from SMB1)"
+            )
             self.send_smb2_command(command.getData(), command=smb2.SMB2_NEGOTIATE)
             return
 
@@ -1566,10 +1508,10 @@ class SMBHandler(BaseProtoHandler):
             command["Data"] = _dialects_data
             command["Parameters"] = _dialects_parameters
 
-            self.log_server(
-                "selected dialect: NT LM 0.12 (non-extended)",
-                "SMB_COM_NEGOTIATE",
+            self.logger.debug(
+                "S: <SMB_COM_NEGOTIATE> selected dialect: NT LM 0.12 (non-extended)",
             )
+            self.client_info["smb_dialect"] = "NT LM 0.12 (non-extended)"
             resp.addCommand(command)
             self.send_data(resp.getData())
             return
@@ -1593,7 +1535,8 @@ class SMBHandler(BaseProtoHandler):
         command["Data"] = _dialects_data
         command["Parameters"] = _dialects_parameters
 
-        self.log_server("selected dialect: NT LM 0.12", "SMB_COM_NEGOTIATE")
+        self.logger.debug("S: <SMB_COM_NEGOTIATE> selected dialect: NT LM 0.12")
+        self.client_info["smb_dialect"] = "NT LM 0.12"
         resp.addCommand(command)
         self.send_data(resp.getData())
 
@@ -1641,6 +1584,11 @@ class SMBHandler(BaseProtoHandler):
                     self.client_info["smb_os"] = client_os
                 if client_lanman:
                     self.client_info["smb_lanman"] = client_lanman
+                self.logger.debug(
+                    f"C: SMB_COM_SESSION_SETUP_ANDX extended: "
+                    f"NativeOS={client_os or '(empty)'} "
+                    f"NativeLanMan={client_lanman or '(empty)'}",
+                )
             except Exception:
                 self.logger.debug(
                     "Failed to extract SMB1 session setup client info",
@@ -1736,19 +1684,22 @@ class SMBHandler(BaseProtoHandler):
         account = strings[0] if len(strings) > 0 else ""
         domain = strings[1] if len(strings) > 1 else ""
 
-        self.logger.debug(
-            f"<SMB_COM_SESSION_SETUP_ANDX> account={account!r} "
-            f"domain={domain!r} oem_len={oem_len} uni_len={uni_len}",
-            is_client=True,
-        )
-        if account:
-            self.client_info["account"] = account
-        if domain:
-            self.client_info["smb_domain"] = domain
-
         # NativeOS and NativeLanMan follow Account and PrimaryDomain
         client_os = strings[2] if len(strings) > 2 else ""
         client_lanman = strings[3] if len(strings) > 3 else ""
+
+        self.logger.debug(
+            f"C: SMB_COM_SESSION_SETUP_ANDX basic: "
+            f"AccountName={account or '(empty)'} "
+            f"PrimaryDomain={domain or '(empty)'} "
+            f"NativeOS={client_os or '(empty)'} "
+            f"NativeLanMan={client_lanman or '(empty)'} "
+            f"OemPwdLen={oem_len} UniPwdLen={uni_len}",
+        )
+        if account:
+            self.client_info["smb_account"] = account
+        if domain:
+            self.client_info["smb_domain"] = domain
         if client_os:
             self.client_info["smb_os"] = client_os
         if client_lanman:
@@ -1772,9 +1723,8 @@ class SMBHandler(BaseProtoHandler):
         ):
             # Unexpected plaintext despite challenge — [MS-CIFS] §3.2.4.2.4
             self.logger.display(
-                "<SMB_COM_SESSION_SETUP_ANDX> Plaintext password detected "
+                "C: <SMB_COM_SESSION_SETUP_ANDX> Plaintext password detected "
                 "despite challenge (unusual client behavior)",
-                is_client=True,
             )
             transport = NTLM_TRANSPORT_CLEARTEXT
         else:
@@ -1792,7 +1742,7 @@ class SMBHandler(BaseProtoHandler):
                 password = ""
 
             if password and account:
-                NTLM_report_raw_fields(
+                NTLM_handle_legacy_raw_auth(
                     user_name=account,
                     domain_name=domain,
                     lm_response=None,
@@ -1805,7 +1755,7 @@ class SMBHandler(BaseProtoHandler):
                     cleartext_password=password,
                 )
         elif transport == NTLM_TRANSPORT_RAW:
-            NTLM_report_raw_fields(
+            NTLM_handle_legacy_raw_auth(
                 user_name=account,
                 domain_name=domain,
                 lm_response=oem_pwd,
@@ -1837,7 +1787,7 @@ class SMBHandler(BaseProtoHandler):
         )
 
         # Determine error code — multi-cred or final
-        error_code = self.resolve_auth_error_code()
+        error_code = self._resolve_auth_error_code()
 
         self.send_smb1_command(
             smb.SMB.SMB_COM_SESSION_SETUP_ANDX,
@@ -1856,7 +1806,7 @@ class SMBHandler(BaseProtoHandler):
         :param packet: Parsed SMB1 packet from the client
         :type packet: smb.NewSMBPacket
         """
-        self.log_client("Client requested logoff", "SMB_COM_LOGOFF_ANDX")
+        self.logger.debug("C: <SMB_COM_LOGOFF_ANDX> Client requested logoff")
 
         # SMBLogOffAndX packs the AndX response: 0xFF,0x00,0x0000
         parameters = smb.SMBLogOffAndX()
@@ -1895,13 +1845,12 @@ class SMBHandler(BaseProtoHandler):
                 else str(raw_path)
             ).rstrip("\x00")
             self.logger.debug(
-                f"<SMB_COM_TREE_CONNECT_ANDX> Tree connect: {path}",
-                is_client=True,
+                f"C: SMB_COM_TREE_CONNECT_ANDX: Path={path or '(empty)'}",
             )
             if path:
-                self.client_info["path"] = path
+                self.client_info["smb_path"] = path
         except Exception:
-            self.log_client("Tree connect (malformed)", "SMB_COM_TREE_CONNECT_ANDX")
+            self.logger.debug("C: <SMB_COM_TREE_CONNECT_ANDX> Tree connect (malformed)")
 
         resp_params = smb.SMBTreeConnectAndXResponse_Parameters()
         # [MS-CIFS] §2.2.4.55.2: SMB_SUPPORT_SEARCH_BITS

@@ -34,8 +34,8 @@ from impacket import ntlm
 from dementor.config.session import SessionConfig
 from dementor.loader import BaseProtocolModule, DEFAULT_ATTR
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
-    NTLM_report_auth,
+    NTLM_build_challenge_message,
+    NTLM_handle_authenticate_message,
     NTLM_split_fqdn,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
@@ -177,7 +177,7 @@ class IMAPHandler(BaseProtoHandler):
         self._write_line(line)
 
     def _write_line(self, msg: str) -> None:
-        self.logger.debug(repr(msg), is_server=True)
+        self.logger.debug(f"S: {msg!r}")
         self.send(f"{msg}\r\n".encode("utf-8", "strict"))
 
     #  There are three possible server completion responses:
@@ -227,7 +227,7 @@ class IMAPHandler(BaseProtoHandler):
         # If the client wishes to cancel an authentication exchange, it issues a line consisting
         # of a single "*"
         resp = self.rfile.readline(1024).strip()
-        self.logger.debug(repr(resp), is_client=True)
+        self.logger.debug(f"C: {resp!r}")
         if resp == b"*":
             self.bad("Authentication canceled")
             raise StopHandler
@@ -284,7 +284,7 @@ class IMAPHandler(BaseProtoHandler):
         data = self.rfile.readline(size)
         if data:
             text = data.decode("utf-8", errors="replace").strip()
-            self.logger.debug(repr(data), is_client=True)
+            self.logger.debug(f"C: {data!r}")
             return text
 
     # implementation
@@ -365,7 +365,7 @@ class IMAPHandler(BaseProtoHandler):
             return self.bad("NTLM negotiation failed")
 
         # IMAP4_AUTHENTICATE_NTLM_Blob_Response
-        challenge = NTLM_AUTH_CreateChallenge(
+        challenge = NTLM_build_challenge_message(
             negotiate,
             *NTLM_split_fqdn(self.server_config.imap_fqdn),
             challenge=self.server_config.ntlm_challenge,
@@ -382,7 +382,7 @@ class IMAPHandler(BaseProtoHandler):
             self.logger.debug(f"NTLM authentication failed: {e}")
             return self.bad("NTLM authentication failed")
 
-        NTLM_report_auth(
+        NTLM_handle_authenticate_message(
             auth_message,
             challenge=self.server_config.ntlm_challenge,
             client=self.client_address,

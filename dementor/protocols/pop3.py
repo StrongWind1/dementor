@@ -35,8 +35,8 @@ from impacket import ntlm
 from dementor.loader import BaseProtocolModule, DEFAULT_ATTR
 from dementor.config.session import SessionConfig
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
-    NTLM_report_auth,
+    NTLM_build_challenge_message,
+    NTLM_handle_authenticate_message,
     NTLM_split_fqdn,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
@@ -148,7 +148,7 @@ class POP3Handler(BaseProtoHandler):
         line = str(msg)
         if prefix:
             line = f"{prefix} {line}"
-        self.logger.debug(repr(line), is_server=True)
+        self.logger.debug(f"S: {line!r}")
         self.send(f"{line}\r\n".encode("utf-8", "strict"))
 
     def challenge_auth(
@@ -163,7 +163,7 @@ class POP3Handler(BaseProtoHandler):
 
         self.line(line)
         resp = self.rfile.readline(1024).strip().decode("utf-8", errors="replace")
-        self.logger.debug(repr(resp), is_client=True)
+        self.logger.debug(f"C: {resp!r}")
         # A client response consists of a line containing a string
         # encoded as Base64.  If the client wishes to cancel the
         # authentication exchange, it issues a line with a single "*".
@@ -190,7 +190,7 @@ class POP3Handler(BaseProtoHandler):
         # The POP3 session is now in the AUTHORIZATION state.  The client must
         # now identify and authenticate itself to the POP3 server.
         while line := self.rfile.readline(1024):
-            self.logger.debug(repr(line), is_client=True)
+            self.logger.debug(f"C: {line!r}")
             line = line.decode("utf-8", errors="replace").strip()
 
             args = line.split(" ")
@@ -362,7 +362,7 @@ class POP3Handler(BaseProtoHandler):
 
         # 3. The server sends a POP3_AUTH_NTLM_Blob_Response message containing
         # a base64-encoded NTLM CHALLENGE_MESSAGE.
-        challenge = NTLM_AUTH_CreateChallenge(
+        challenge = NTLM_build_challenge_message(
             negotiate,
             *NTLM_split_fqdn(self.server_config.pop3_fqdn),
             challenge=self.server_config.ntlm_challenge,
@@ -376,7 +376,7 @@ class POP3Handler(BaseProtoHandler):
         auth_message = ntlm.NTLMAuthChallengeResponse()
         auth_message.fromString(token)
 
-        NTLM_report_auth(
+        NTLM_handle_authenticate_message(
             auth_message,
             challenge=self.server_config.ntlm_challenge,
             client=self.client_address,

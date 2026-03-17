@@ -35,11 +35,11 @@ from impacket import ntlm
 from dementor.config.toml import TomlConfig, Attribute as A
 from dementor.log.logger import ProtocolLogger, dm_logger
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
+    NTLM_build_challenge_message,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
     ATTR_NTLM_DISABLE_NTLMV2,
-    NTLM_report_auth,
+    NTLM_handle_authenticate_message,
     NTLM_split_fqdn,
 )
 from dementor.servers import ThreadingTCPServer, BaseProtoHandler
@@ -297,7 +297,7 @@ class RPCHandler(BaseProtoHandler):
                 # generate challenge
                 negotiate = ntlm.NTLMAuthNegotiate()
                 negotiate.fromString(token)
-                challenge = NTLM_AUTH_CreateChallenge(
+                challenge = NTLM_build_challenge_message(
                     negotiate,
                     *NTLM_split_fqdn(self.rpc_config.rpc_fqdn),
                     challenge=self.rpc_config.ntlm_challenge,
@@ -342,7 +342,7 @@ class RPCHandler(BaseProtoHandler):
 
         auth_resp = ntlm.NTLMAuthChallengeResponse()
         auth_resp.fromString(token)
-        NTLM_report_auth(
+        NTLM_handle_authenticate_message(
             auth_token=auth_resp,
             challenge=conn.challenge["challenge"],
             client=self.client_address,

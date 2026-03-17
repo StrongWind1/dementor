@@ -51,8 +51,8 @@ from dementor.servers import (
 )
 from dementor.db import _CLEARTEXT
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
-    NTLM_report_auth,
+    NTLM_build_challenge_message,
+    NTLM_handle_authenticate_message,
     NTLM_split_fqdn,
     ATTR_NTLM_CHALLENGE,
     ATTR_NTLM_DISABLE_ESS,
@@ -181,7 +181,7 @@ class LDAPHandler(BaseProtoHandler):
         else:
             name, domain = fqdn, ""
 
-        ntlm_challenge = NTLM_AUTH_CreateChallenge(
+        ntlm_challenge = NTLM_build_challenge_message(
             negotiate,
             name,
             domain,
@@ -196,7 +196,7 @@ class LDAPHandler(BaseProtoHandler):
     def handle_NTLM_Auth(self, req: LDAPMessage, blob: bytes) -> None | bool:
         auth_message = NTLMAuthChallengeResponse()
         auth_message.fromString(blob)
-        NTLM_report_auth(
+        NTLM_handle_authenticate_message(
             auth_token=auth_message,
             challenge=self.server.server_config.ntlm_challenge,
             client=self.client_address,
@@ -270,7 +270,7 @@ class LDAPHandler(BaseProtoHandler):
         if data[8] == 0x01:
             token = ntlm.NTLMAuthNegotiate()
             token.fromString(data)
-            ntlm_challenge = NTLM_AUTH_CreateChallenge(
+            ntlm_challenge = NTLM_build_challenge_message(
                 token,
                 *NTLM_split_fqdn(self.server.server_config.ldap_fqdn),
                 challenge=self.server.server_config.ntlm_challenge,
@@ -288,7 +288,7 @@ class LDAPHandler(BaseProtoHandler):
         if data[8] == 0x03:  # AUTH
             token = ntlm.NTLMAuthChallengeResponse()
             token.fromString(data)
-            NTLM_report_auth(
+            NTLM_handle_authenticate_message(
                 auth_token=token,
                 challenge=self.server.server_config.ntlm_challenge,
                 client=self.client_address,

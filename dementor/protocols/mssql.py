@@ -50,11 +50,11 @@ from dementor.config.toml import TomlConfig, Attribute as A
 from dementor.log.hexdump import hexdump
 from dementor.log.logger import ProtocolLogger
 from dementor.protocols.ntlm import (
-    NTLM_AUTH_CreateChallenge,
+    NTLM_build_challenge_message,
     ATTR_NTLM_DISABLE_ESS,
     ATTR_NTLM_DISABLE_NTLMV2,
     ATTR_NTLM_CHALLENGE,
-    NTLM_report_auth,
+    NTLM_handle_authenticate_message,
     NTLM_split_fqdn,
 )
 from dementor.servers import (
@@ -429,7 +429,7 @@ class MSSQLHandler(BaseProtoHandler):
                 self.send_error(packet)
                 return 1
 
-            self.challenge = NTLM_AUTH_CreateChallenge(
+            self.challenge = NTLM_build_challenge_message(
                 negotiate,
                 *NTLM_split_fqdn(self.config.mssql_config.mssql_fqdn),
                 challenge=self.config.mssql_config.ntlm_challenge,
@@ -459,7 +459,7 @@ class MSSQLHandler(BaseProtoHandler):
             self.send_error(packet)
             return 1
 
-        NTLM_report_auth(
+        NTLM_handle_authenticate_message(
             auth_message,
             challenge=self.challenge["challenge"],
             client=self.client_address,
