@@ -274,10 +274,6 @@ class ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
         port = self.get_port(kwargs) or "<no-port>"
         colour = self.get_protocol_color(kwargs)
 
-        # Pop keys that are meaningful only to the logger, not to Rich Console.
-        kwargs.pop("is_client", False)
-        kwargs.pop("is_server", False)
-
         formatted = f"{ts_prefix}[bold {colour}]{proto:<10}[/] {host:<25} {port:<6} {msg}"
         return formatted, kwargs
 
@@ -286,12 +282,12 @@ class ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
     ) -> tuple[str, dict[str, Any]]:
         """Produce a compact inline representation for convenience methods.
 
-        The format resembles ``(PROTO) (host:port) <direction> message``.
+        The format resembles ``(PROTO) (host:port) message``.
 
         :param msg: The original log message.
         :type msg: str
         :param kwargs: Mapping that may contain ``protocol``, ``host``,
-                       ``port``, ``is_server`` and ``is_client`` flags.
+                       and ``port``.
         :type kwargs: dict[str, Any]
         :return: Rendered line and the (potentially mutated) ``kwargs``.
         :rtype: tuple[str, dict[str, Any]]
@@ -299,14 +295,8 @@ class ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
         proto = self.get_protocol_name(kwargs)
         host = self.get_host(kwargs)
         port = self.get_port(kwargs) or "-"
-        is_server = kwargs.pop("is_server", False)
-        is_client = kwargs.pop("is_client", False)
 
         line = msg
-        if is_client:
-            line = f"C: {line}"
-        elif is_server:
-            line = f"S: {line}"
         if host:
             line = f"({host}:{port}) {line}"
         if proto:
