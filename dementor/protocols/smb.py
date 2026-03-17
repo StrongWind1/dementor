@@ -1217,10 +1217,11 @@ class SMBHandler(BaseProtoHandler):
         )
         if dialect is None:
             self.logger.fail(f"Client requested unsupported dialects: {str_req_dialects}")
-            # [MS-SMB2] §3.3.5.4: respond with STATUS_NOT_SUPPORTED
-            err_resp = smb2.SMB2Negotiate_Response()
+            # [MS-SMB2] §3.3.5.4: respond with STATUS_NOT_SUPPORTED.
+            # Use raw bytes: impacket's SMB2Negotiate_Response can't
+            # serialize without all fields populated.
             self.send_smb2_command(
-                err_resp.getData(),
+                b"\x00" * 64,  # minimal 64-byte negotiate response body
                 status=nt_errors.STATUS_NOT_SUPPORTED,
                 command=smb2.SMB2_NEGOTIATE,
             )
@@ -1576,9 +1577,12 @@ class SMBHandler(BaseProtoHandler):
                 blob_len: int = setup_params["SecurityBlobLength"]
                 raw_after_blob = command["Data"][blob_len:]
                 # [MS-CIFS] §2.2.4.53.1: Unicode strings are 2-byte aligned
-                # from the start of the SMB header. When SecurityBlob has
-                # even length, a 1-byte pad precedes the first Unicode string.
-                if is_unicode and len(raw_after_blob) > 0 and raw_after_blob[0] == 0:
+                # from the start of the SMB header. Fixed overhead for
+                # WordCount=12: 32(hdr)+1(WC)+24(params)+2(BC) = 59 (odd).
+                # Padding needed when (59 + blob_len) is odd → blob_len even.
+                # Cannot check byte value: NT 4.0 uses non-zero pad bytes.
+                needs_pad = is_unicode and blob_len % 2 == 0
+                if needs_pad and len(raw_after_blob) > 0:
                     raw_after_blob = raw_after_blob[1:]
                 parts = _split_smb_strings(raw_after_blob, is_unicode)
                 client_os = parts[0] if len(parts) > 0 else ""
@@ -1675,21 +1679,64 @@ class SMBHandler(BaseProtoHandler):
         # Password fields come first at known offsets
         oem_pwd: bytes = raw_data[:oem_len] if oem_len else b""
         uni_pwd: bytes = raw_data[oem_len : oem_len + uni_len] if uni_len else b""
+
+        # Determine transport type FIRST — needed for string parsing.
+        # [MS-CIFS] §3.2.4.2.4: even when NEGOTIATE_ENCRYPT_PASSWORDS is
+        # set, the server "MAY also accept plaintext." Detect cleartext-
+        # despite-challenge via non-standard response lengths.
+        if not self.smb1_negotiate_encrypt:
+            # Server advertised plaintext mode (ForceSMB1Plaintext=true)
+            transport: str | None = NTLM_TRANSPORT_CLEARTEXT
+        elif oem_len == 0 and uni_len == 0:
+            # Anonymous — no credentials at all
+            transport = None
+        elif uni_len == 0 and oem_len <= 1 and oem_pwd in (b"", b"\x00"):
+            # NT 4.0 null session: OemPwdLen=1 with value \x00.
+            # [MS-NLMP] §3.2.5.1.2: Z(1) LmChallengeResponse = anonymous.
+            transport = None
+        elif self.smb1_negotiate_encrypt and (
+            # Only OEM populated with non-standard length (not 0, not 24)
+            (uni_len == 0 and oem_len not in (0, 24) and oem_len <= 256)
+            # Only Unicode populated with non-standard length
+            or (oem_len == 0 and uni_len not in (0, 24) and uni_len <= 512)
+        ):
+            # Unexpected plaintext despite challenge — [MS-CIFS] §3.2.4.2.4
+            self.logger.display(
+                "C: <SMB_COM_SESSION_SETUP_ANDX> Plaintext password detected "
+                "despite challenge (unusual client behavior)",
+            )
+            transport = NTLM_TRANSPORT_CLEARTEXT
+        else:
+            transport = NTLM_TRANSPORT_RAW
+
         # String fields follow passwords: Account, PrimaryDomain, NativeOS, NativeLanMan
         # Each is null-terminated in the encoding indicated by FLAGS2_UNICODE.
         string_data = raw_data[oem_len + uni_len :]
-        # [MS-CIFS] §2.2.4.53.1: Unicode strings are 2-byte aligned.
-        # Detect padding by checking if the first byte is \x00 (same
-        # approach proven on the extended security path).
-        if is_unicode and len(string_data) > 0 and string_data[0] == 0:
+        # [MS-CIFS] §2.2.4.53.1: Unicode strings are 2-byte aligned from
+        # the SMB header start. Fixed overhead for WordCount=13:
+        # 32(hdr)+1(WC)+26(params)+2(BC) = 61 (odd). Padding needed when
+        # (61 + oem_len + uni_len) is odd, i.e., (oem_len + uni_len) even.
+        # Cannot check byte value: NT 4.0 uses non-zero pad bytes (0x69).
+        needs_pad = is_unicode and (oem_len + uni_len) % 2 == 0
+        if needs_pad and len(string_data) > 0:
             string_data = string_data[1:]
         strings = _split_smb_strings(string_data, is_unicode)
-        account = strings[0] if len(strings) > 0 else ""
-        domain = strings[1] if len(strings) > 1 else ""
 
-        # NativeOS and NativeLanMan follow Account and PrimaryDomain
-        client_os = strings[2] if len(strings) > 2 else ""
-        client_lanman = strings[3] if len(strings) > 3 else ""
+        # For anonymous sessions, Account and PrimaryDomain may be absent
+        # or encoded as single ASCII null bytes despite FLAGS2_UNICODE
+        # (observed on NT 4.0). The positional parser would assign NativeOS
+        # to account. Detect anonymous and parse only OS/LanMan fields.
+        if transport is None:
+            account = ""
+            domain = ""
+            # Best-effort: first two non-empty strings are NativeOS/NativeLanMan
+            client_os = strings[0] if len(strings) > 0 else ""
+            client_lanman = strings[1] if len(strings) > 1 else ""
+        else:
+            account = strings[0] if len(strings) > 0 else ""
+            domain = strings[1] if len(strings) > 1 else ""
+            client_os = strings[2] if len(strings) > 2 else ""
+            client_lanman = strings[3] if len(strings) > 3 else ""
 
         self.logger.debug(
             f"C: SMB_COM_SESSION_SETUP_ANDX basic: "
@@ -1708,37 +1755,22 @@ class SMBHandler(BaseProtoHandler):
         if client_lanman:
             self.client_info["smb_lanman"] = client_lanman
 
-        # Determine transport type — cleartext vs challenge/response
-        # [MS-CIFS] §3.2.4.2.4: even when NEGOTIATE_ENCRYPT_PASSWORDS is
-        # set, the server "MAY also accept plaintext." Detect cleartext-
-        # despite-challenge via non-standard response lengths.
-        if not self.smb1_negotiate_encrypt:
-            # Server advertised plaintext mode (ForceSMB1Plaintext=true)
-            transport = NTLM_TRANSPORT_CLEARTEXT
-        elif oem_len == 0 and uni_len == 0:
-            # Anonymous — no credentials at all
-            transport = None
-        elif self.smb1_negotiate_encrypt and (
-            # Only OEM populated with non-standard length (not 0, not 24)
-            (uni_len == 0 and oem_len not in (0, 24) and oem_len <= 256)
-            # Only Unicode populated with non-standard length
-            or (oem_len == 0 and uni_len not in (0, 24) and uni_len <= 512)
-        ):
-            # Unexpected plaintext despite challenge — [MS-CIFS] §3.2.4.2.4
-            self.logger.display(
-                "C: <SMB_COM_SESSION_SETUP_ANDX> Plaintext password detected "
-                "despite challenge (unusual client behavior)",
-            )
-            transport = NTLM_TRANSPORT_CLEARTEXT
-        else:
-            transport = NTLM_TRANSPORT_RAW
-
         # Capture credentials
         if transport == NTLM_TRANSPORT_CLEARTEXT:
             # [MS-CIFS] §2.2.4.53.1: cleartext in UnicodePassword (UTF-16LE)
             # when FLAGS2_UNICODE, else in OEMPassword (ASCII)
             if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE and uni_pwd:
-                password = uni_pwd.decode("utf-16-le", errors="replace")
+                pwd_data = uni_pwd
+                # [MS-CIFS] §2.2.4.53.1: UnicodePassword starts at offset
+                # 61 + OemPwdLen from the SMB header. When this is odd,
+                # clients (smbclient) prepend a 1-byte alignment pad
+                # included in UnicodePasswordLen. Strip it for decode.
+                if (oem_len % 2 == 0) and len(pwd_data) > 0:
+                    pwd_data = pwd_data[1:]
+                # Trim to even length for valid UTF-16LE decode
+                if len(pwd_data) % 2 == 1:
+                    pwd_data = pwd_data[:-1]
+                password = pwd_data.decode("utf-16-le", errors="replace").rstrip("\x00")
             elif oem_pwd:
                 password = oem_pwd.decode("ascii", errors="replace")
             else:
@@ -1840,13 +1872,19 @@ class SMBHandler(BaseProtoHandler):
             raw_path = tc_data["Path"]
             # [MS-CIFS] §2.2.4.55.1: Path encoding per FLAGS2_UNICODE
             path = (
-                raw_path.decode(
-                    "utf-16-le" if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE else "ascii",
-                    errors="replace",
+                (
+                    raw_path.decode(
+                        "utf-16-le"
+                        if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE
+                        else "ascii",
+                        errors="replace",
+                    )
+                    if isinstance(raw_path, bytes)
+                    else str(raw_path)
                 )
-                if isinstance(raw_path, bytes)
-                else str(raw_path)
-            ).rstrip().rstrip("\x00")
+                .rstrip()
+                .rstrip("\x00")
+            )
             self.logger.debug(
                 f"C: SMB_COM_TREE_CONNECT_ANDX: Path={path or '(empty)'}",
             )
