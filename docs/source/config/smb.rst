@@ -254,7 +254,7 @@ The SMB handler accepts NTLM tokens in two forms:
   performs the NTLM handshake internally, and returns appropriately wrapped
   ``negTokenTarg`` responses.
 
-In both cases the captured hash is passed to :func:`~ntlm.NTLM_report_auth` and stored
+In both cases the captured hash is passed to :func:`~ntlm.NTLM_handle_authenticate_message` and stored
 in the session database.
 
 Protocol Version Negotiation

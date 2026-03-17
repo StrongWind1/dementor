@@ -388,7 +388,7 @@ def NTLM_decode_string(
 
     # [MS-NLMP] §2.2.1.3: AUTHENTICATE_MESSAGE encoding per NEGOTIATE_UNICODE
     if negotiate_flags & ntlm.NTLMSSP_NEGOTIATE_UNICODE:
-        return data.decode("utf-16-le", errors="replace").rstrip("\x00")
+        return data.decode("utf-16-le", errors="replace").rstrip().rstrip("\x00")
 
     # OEM fallback — cp437 as baseline; actual code page is system-dependent
     return data.decode("cp437", errors="replace")
@@ -550,7 +550,7 @@ def NTLM_handle_negotiate_message(
     try:
         flags = negotiate["flags"]
         parts = [f"flags=0x{flags:08x}"]
-        parts.append(f"os={os_str!r}" if os_str else "os=(none)")
+        parts.append(f"os={os_str!r}" if os_str else "os=(empty)")
         parts.append(f"domain={domain_str!r}" if domain_str else "domain=(empty)")
         parts.append(
             f"workstation={workstation_str!r}"
@@ -994,14 +994,15 @@ def NTLM_handle_authenticate_message(
         try:
             if negotiate_flags & ntlm.NTLMSSP_NEGOTIATE_VERSION:
                 mic_val: bytes = auth_token["MIC"]
-                if mic_val and len(mic_val) == 16 and mic_val != b"\x00" * 16:
-                    mic_str = mic_val.hex()
-                else:
-                    mic_str = "(empty)"
+                mic_str = (
+                    mic_val.hex()
+                    if mic_val and len(mic_val) == 16 and mic_val != b"\x00" * 16
+                    else "(empty)"
+                )
         except Exception:  # noqa: S110
             pass
         auth_parts = [f"flags=0x{negotiate_flags:08x}"]
-        auth_parts.append(f"os={os_str!r}" if os_str else "os=(none)")
+        auth_parts.append(f"os={os_str!r}" if os_str else "os=(empty)")
         user_name: str = NTLM_decode_string(auth_token["user_name"], negotiate_flags)
         domain_name: str = NTLM_decode_string(auth_token["domain_name"], negotiate_flags)
         auth_parts.append(f"user={user_name!r}" if user_name else "user=(empty)")
@@ -1071,7 +1072,7 @@ def NTLM_handle_authenticate_message(
             parts = [
                 f"{label}:{ntlm_display[k]}"
                 for k, label in display_keys
-                if k in ntlm_display
+                if ntlm_display.get(k)
             ]
             if parts:
                 log.display(f"NTLM: {' | '.join(parts)}")

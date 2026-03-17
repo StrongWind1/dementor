@@ -656,8 +656,8 @@ class SMBHandler(BaseProtoHandler):
                     calling_name = field.m2i(None, b"\x20" + caller[:-2]).decode(
                         errors="replace"
                     )
-                    cn = calling_name.rstrip()
-                    cdn = called_name.rstrip()
+                    cn = calling_name.rstrip().rstrip("\x00")
+                    cdn = called_name.rstrip().rstrip("\x00")
                     self.logger.debug(
                         f"C: NETBIOS_SESSION_REQUEST: "
                         f"CallingName={cn or '(empty)'} "
@@ -747,7 +747,9 @@ class SMBHandler(BaseProtoHandler):
             ("smb_dialect", "dialect"),
         ]
         parts = [
-            f"{label}:{self.client_info[k]}" for k, label in keys if k in self.client_info
+            f"{label}:{self.client_info[k]}"
+            for k, label in keys
+            if self.client_info.get(k)
         ]
         if parts:
             self.logger.display(f"SMB: {' | '.join(parts)}")
@@ -1472,6 +1474,7 @@ class SMBHandler(BaseProtoHandler):
                 # Clear NEGOTIATE_ENCRYPT_PASSWORDS → plaintext passwords
                 _dialects_parameters["SecurityMode"] = smb.SMB.SECURITY_SHARE_USER
                 _dialects_parameters["ChallengeLength"] = 0
+                _dialects_data["Challenge"] = b""
                 self.smb1_negotiate_encrypt = False
             else:
                 _dialects_parameters["SecurityMode"] = (
@@ -1843,7 +1846,7 @@ class SMBHandler(BaseProtoHandler):
                 )
                 if isinstance(raw_path, bytes)
                 else str(raw_path)
-            ).rstrip("\x00")
+            ).rstrip().rstrip("\x00")
             self.logger.debug(
                 f"C: SMB_COM_TREE_CONNECT_ANDX: Path={path or '(empty)'}",
             )
