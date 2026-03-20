@@ -1321,16 +1321,17 @@ class SMBHandler(BaseProtoHandler):
         command["SecurityBufferOffset"] = 0x48
         command["Buffer"] = resp_token
 
-        # [MS-SMB2] §2.2.6: SessionFlags — set IS_GUEST so the client
-        # sets Session.SigningRequired=FALSE per §3.2.5.3.1.  Without
-        # this, SMB 3.x clients require the final SESSION_SETUP SUCCESS
-        # response to be signed with a session key that a capture server
-        # cannot compute (requires knowing the password).
+        # [MS-SMB2] §2.2.6: SessionFlags — set IS_GUEST (0x0001) so the
+        # client sets Session.SigningRequired=FALSE per §3.2.5.3.1.
         #
-        # Verified by pcap: without IS_GUEST, unsigned SUCCESS → RST.
-        # With IS_GUEST + unsigned: works on Win8.1/Srv2012R2/Srv2016.
-        # Win10 1709+ / Srv2019+ reject IS_GUEST (AllowInsecureGuestAccess
-        # = FALSE) and RST regardless.
+        # Brute-force tested all 63 permutations of SessionFlags (0x0000-
+        # 0x0014) × signing mode (none/zeros/random) against Win10 1709+.
+        # All 63 produce TCP RST. The client either rejects IS_GUEST
+        # (AllowInsecureGuestAccess=FALSE) or requires a valid signature
+        # (computed from session key derived from the password).
+        #
+        # IS_GUEST works for pre-Win10 1709 clients (Win8.1, Srv2012R2,
+        # Srv2016) which accept guest sessions and proceed to tree connect.
         if error_code == nt_errors.STATUS_SUCCESS:
             command["SessionFlags"] = 0x0001  # SMB2_SESSION_FLAG_IS_GUEST
 
