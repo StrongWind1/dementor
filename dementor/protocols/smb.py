@@ -433,6 +433,9 @@ class SMBHandler(BaseProtoHandler):
         # Server-assigned tree IDs for this connection. Starts at 1;
         # incremented for each TREE_CONNECT. [MS-SMB2] §3.3.5.7
         self.smb2_tree_id_counter: int = 0
+        # Selected SMB2 dialect for this connection, set during negotiate.
+        # Used by FSCTL_VALIDATE_NEGOTIATE_INFO. [MS-SMB2] §3.3.5.15.12
+        self.smb2_selected_dialect: int = 0
         # Tracks how many credential captures have occurred on this
         # connection. Used to implement multi-credential capture: after
         # each capture (except the last), the server returns
@@ -730,9 +733,11 @@ class SMBHandler(BaseProtoHandler):
             # instead of dropping the connection.  This keeps the session
             # alive so the client can proceed to TREE_CONNECT with the
             # real share path after IPC$ queries (CREATE, IOCTL, CLOSE).
+            # [MS-SMB2] §2.2.2: Error responses use SMB2 ERROR structure
             self.logger.debug(f"C: {title} (unhandled, returning NOT_SUPPORTED)")
+            resp = smb2.SMB2Error()
             self.send_smb2_command(
-                b"\x00" * 8,  # minimal response body
+                resp.getData(),
                 packet,
                 status=nt_errors.STATUS_NOT_SUPPORTED,
             )
@@ -1263,16 +1268,17 @@ class SMBHandler(BaseProtoHandler):
         if dialect is None:
             self.logger.fail(f"Client requested unsupported dialects: {str_req_dialects}")
             # [MS-SMB2] §3.3.5.4: respond with STATUS_NOT_SUPPORTED.
-            # Use raw bytes: impacket's SMB2Negotiate_Response can't
-            # serialize without all fields populated.
+            # [MS-SMB2] §2.2.2: error responses use SMB2 ERROR structure.
+            resp = smb2.SMB2Error()
             self.send_smb2_command(
-                b"\x00" * 64,  # minimal 64-byte negotiate response body
+                resp.getData(),
                 status=nt_errors.STATUS_NOT_SUPPORTED,
                 command=smb2.SMB2_NEGOTIATE,
             )
             raise BaseProtoHandler.TerminateConnection
 
         command = self._build_smb2_negotiate_response(dialect, req)
+        self.smb2_selected_dialect = dialect
         self.client_info["smb_dialect"] = SMB2_DIALECTS.get(dialect, hex(dialect))
         self.logger.debug(
             f"S: <SMB2_NEGOTIATE> selected dialect: {SMB2_DIALECTS.get(dialect, hex(dialect))}",
@@ -1434,49 +1440,149 @@ class SMBHandler(BaseProtoHandler):
             resp["ShareFlags"] = 0x00000000
             self.send_smb2_command(resp.getData(), packet, status=error_code)
 
-    def handle_smb2_ioctl(self, packet: smb2.SMB2Packet) -> None:
-        """SMB2 IOCTL handler — returns STATUS_FS_DRIVER_REQUIRED for DFS.
+    def _smb2_error_response(self, packet: smb2.SMB2Packet, status: int) -> None:
+        """Send a spec-compliant SMB2 error response.
 
-        Clients send FSCTL_DFS_GET_REFERRALS on IPC$ after auth to check
-        if the target is a DFS path.  Returning STATUS_FS_DRIVER_REQUIRED
-        (matching impacket's smbserver) tells the client "not a DFS path,
-        proceed with direct share access" — which triggers the real
-        TREE_CONNECT with the actual share name.
+        Per [MS-SMB2] §2.2.2, error responses use the SMB2 ERROR Response
+        structure (StructureSize=0x09) with the appropriate NTSTATUS code.
+
+        :param packet: The original request packet
+        :type packet: smb2.SMB2Packet
+        :param status: NTSTATUS error code
+        :type status: int
+        """
+        resp = smb2.SMB2Error()
+        self.send_smb2_command(resp.getData(), packet, status=status)
+
+    def handle_smb2_ioctl(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 IOCTL handler -- [MS-SMB2] §3.3.5.15.
+
+        Handles two critical IOCTL codes:
+
+        - **FSCTL_VALIDATE_NEGOTIATE_INFO** (0x00140204): SMB 3.0+ clients
+          send this after IPC$ tree connect to verify negotiate parameters
+          haven't been tampered with.  Per §3.3.5.15.12, the server MUST
+          respond with its Capabilities, Guid, SecurityMode, and Dialect.
+
+        - **FSCTL_DFS_GET_REFERRALS** (0x00060194): Per §3.3.5.15.2,
+          non-DFS servers MUST return ``STATUS_FS_DRIVER_REQUIRED``.
+
+        All other codes return ``STATUS_FS_DRIVER_REQUIRED``.
 
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
         """
-        self.logger.debug("C: SMB2_IOCTL (returning STATUS_FS_DRIVER_REQUIRED)")
-        self.send_smb2_command(
-            b"\x00" * 8,
-            packet,
-            status=nt_errors.STATUS_FS_DRIVER_REQUIRED,
-        )
+        ctl_code = 0
+        try:
+            req = smb2.SMB2Ioctl(packet["Data"])
+            ctl_code = req["CtlCode"]
+            self.logger.debug("C: SMB2_IOCTL CtlCode=0x%08x", ctl_code)
+        except Exception:
+            self.logger.debug("C: SMB2_IOCTL (malformed)")
+            self._smb2_error_response(packet, nt_errors.STATUS_INVALID_PARAMETER)
+            return
+
+        if ctl_code == smb2.FSCTL_VALIDATE_NEGOTIATE_INFO:
+            # [MS-SMB2] §3.3.5.15.12: echo back server negotiate params
+            self._handle_validate_negotiate(packet, req)
+        else:
+            # [MS-SMB2] §3.3.5.15.2: non-DFS → STATUS_FS_DRIVER_REQUIRED
+            self._smb2_error_response(packet, nt_errors.STATUS_FS_DRIVER_REQUIRED)
+
+    def _handle_validate_negotiate(
+        self, packet: smb2.SMB2Packet, req: smb2.SMB2Ioctl
+    ) -> None:
+        """Handle FSCTL_VALIDATE_NEGOTIATE_INFO -- [MS-SMB2] §3.3.5.15.12.
+
+        The client sends its view of the negotiated parameters. The server
+        responds with its own values so the client can verify they match.
+        If they don't, the client drops the connection (anti-downgrade).
+
+        :param packet: Parsed SMB2 packet
+        :type packet: smb2.SMB2Packet
+        :param req: Parsed IOCTL request
+        :type req: smb2.SMB2Ioctl
+        """
+        try:
+            vni = smb2.VALIDATE_NEGOTIATE_INFO(req["Buffer"])
+            self.logger.debug(
+                "C: FSCTL_VALIDATE_NEGOTIATE_INFO: "
+                "Capabilities=0x%08x SecurityMode=0x%04x",
+                vni["Capabilities"],
+                vni["SecurityMode"],
+            )
+
+            # Build response echoing our negotiate values.
+            # These MUST match what we sent in SMB2_NEGOTIATE_RESPONSE.
+            server: SMBServer = self.server  # type: ignore[assignment]
+            vnir = smb2.VALIDATE_NEGOTIATE_INFO_RESPONSE()
+            vnir["Capabilities"] = SMB2_SERVER_CAPABILITIES
+            vnir["Guid"] = server.server_guid
+            vnir["SecurityMode"] = 0x01  # signing enabled, not required
+            vnir["Dialect"] = self.smb2_selected_dialect
+
+            # Build IOCTL response with output data
+            resp = smb2.SMB2Ioctl_Response()
+            resp["CtlCode"] = smb2.FSCTL_VALIDATE_NEGOTIATE_INFO
+            resp["FileID"] = req["FileID"]
+            output_data = vnir.getData()
+            resp["OutputOffset"] = 64 + 48  # header(64) + fixed response(48)
+            resp["OutputCount"] = len(output_data)
+            resp["InputOffset"] = 0
+            resp["InputCount"] = 0
+            resp["Buffer"] = output_data
+
+            self.logger.debug(
+                "S: FSCTL_VALIDATE_NEGOTIATE_INFO: Dialect=0x%04x",
+                self.smb2_selected_dialect,
+            )
+            self.send_smb2_command(resp.getData(), packet)
+
+        except Exception:
+            self.logger.debug("FSCTL_VALIDATE_NEGOTIATE_INFO failed", exc_info=True)
+            self._smb2_error_response(packet, nt_errors.STATUS_ACCESS_DENIED)
 
     def handle_smb2_create(self, packet: smb2.SMB2Packet) -> None:
-        """SMB2 CREATE handler — stub for IPC$ named pipe opens.
+        """SMB2 CREATE handler -- [MS-SMB2] §3.3.5.9.
 
-        Clients may try to open named pipes (e.g. srvsvc) on IPC$ before
-        tree-connecting to the real share.  Returns STATUS_OBJECT_NAME_NOT_FOUND
-        to indicate the pipe doesn't exist without dropping the connection.
+        Clients may try to open named pipes (e.g. ``srvsvc``) on IPC$
+        before tree-connecting to the real share.  Returns
+        ``STATUS_OBJECT_NAME_NOT_FOUND`` per [MS-SMB2] §3.3.5.9 to
+        indicate the file/pipe doesn't exist without dropping the
+        connection.
 
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
         """
-        self.logger.debug("C: SMB2_CREATE (returning OBJECT_NAME_NOT_FOUND)")
-        self.send_smb2_command(
-            b"\x00" * 8,
-            packet,
-            status=nt_errors.STATUS_OBJECT_NAME_NOT_FOUND,
-        )
+        try:
+            req = smb2.SMB2Create(packet["Data"])
+            name_offset = req["NameOffset"] - 64
+            name_length = req["NameLength"]
+            raw = packet["Data"]
+            if name_length > 0 and 0 <= name_offset < len(raw):
+                name = raw[name_offset : name_offset + name_length].decode(
+                    "utf-16-le", errors="replace"
+                )
+            else:
+                name = "(empty)"
+            self.logger.debug("C: SMB2_CREATE Name=%s", name)
+        except Exception:
+            self.logger.debug("C: SMB2_CREATE (malformed)")
+
+        # [MS-SMB2] §2.2.2: Error response for file not found
+        self._smb2_error_response(packet, nt_errors.STATUS_OBJECT_NAME_NOT_FOUND)
 
     def handle_smb2_close(self, packet: smb2.SMB2Packet) -> None:
-        """SMB2 CLOSE handler — acknowledge close requests.
+        """SMB2 CLOSE handler -- [MS-SMB2] §3.3.5.10.
+
+        Acknowledges close requests with a spec-compliant CLOSE response.
+        Per [MS-SMB2] §2.2.16, StructureSize MUST be 0x3C (60).
 
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
         """
         self.logger.debug("C: SMB2_CLOSE")
+        # SMB2Close_Response has all zeros for timestamps/sizes — spec-compliant
         resp = smb2.SMB2Close_Response()
         self.send_smb2_command(resp.getData(), packet)
 
