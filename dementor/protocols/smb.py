@@ -1323,13 +1323,14 @@ class SMBHandler(BaseProtoHandler):
 
         # [MS-SMB2] §2.2.6: SessionFlags — set IS_GUEST so the client
         # sets Session.SigningRequired=FALSE per §3.2.5.3.1.  Without
-        # this, SMB 3.0+ clients require the final SESSION_SETUP SUCCESS
-        # response to be signed, which requires a session key that a
-        # capture server cannot compute.
+        # this, SMB 3.x clients require the final SESSION_SETUP SUCCESS
+        # response to be signed with a session key that a capture server
+        # cannot compute (requires knowing the password).
         #
-        # Win10 1709+ / Srv2019+ have AllowInsecureGuestAccess=FALSE and
-        # reject IS_GUEST with a TCP RST.  Those clients still capture
-        # hashes but cannot provide share paths.
+        # Verified by pcap: without IS_GUEST, unsigned SUCCESS → RST.
+        # With IS_GUEST + unsigned: works on Win8.1/Srv2012R2/Srv2016.
+        # Win10 1709+ / Srv2019+ reject IS_GUEST (AllowInsecureGuestAccess
+        # = FALSE) and RST regardless.
         if error_code == nt_errors.STATUS_SUCCESS:
             command["SessionFlags"] = 0x0001  # SMB2_SESSION_FLAG_IS_GUEST
 
