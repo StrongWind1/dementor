@@ -1321,6 +1321,13 @@ class SMBHandler(BaseProtoHandler):
         command["SecurityBufferOffset"] = 0x48
         command["Buffer"] = resp_token
 
+        # [MS-SMB2] §2.2.6: SessionFlags — set IS_GUEST so the client
+        # sets Session.SigningRequired=FALSE per §3.2.5.3.1.  Without
+        # this, SMB 3.0+ clients require signed responses which a
+        # capture server cannot provide (no session key).
+        if error_code == nt_errors.STATUS_SUCCESS:
+            command["SessionFlags"] = 0x0001  # SMB2_SESSION_FLAG_IS_GUEST
+
         self.send_smb2_command(
             command.getData(),
             packet,
