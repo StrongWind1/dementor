@@ -1254,15 +1254,12 @@ class SMBHandler(BaseProtoHandler):
                 f"C: SMB2_NEGOTIATE: Dialects={str_req_dialects}",
             )
 
-        # Select the best dialect for credential capture.
+        # Select the best dialect for credential and share-path capture.
         #
         # Clients that support 3.1.1 are downgraded to 2.1 to avoid the
-        # preauth integrity hash (which enforces session key derivation
-        # even when signing is disabled).  At 2.1, there's no
-        # VALIDATE_NEGOTIATE_INFO and no preauth hash.
-        #
-        # Clients whose max is 3.0.2 (Win8.1, Srv2012R2) get 3.0.2 with
-        # IS_GUEST to bypass VALIDATE_NEGOTIATE signing.
+        # preauth integrity hash and AllowInsecureGuestAccess rejection.
+        # Clients whose max is 3.0.2 (Win8.1, Srv2012R2) get their
+        # native 3.0.2 + IS_GUEST to bypass VALIDATE_NEGOTIATE signing.
         cfg = self.smb_config
         valid_dialects = sorted(
             (
@@ -1359,8 +1356,9 @@ class SMBHandler(BaseProtoHandler):
         #   At 2.x there's no VALIDATE_NEGOTIATE_INFO IOCTL, and without
         #   IS_GUEST the client proceeds without signing checks.  This
         #   captures Win10/Srv2019/Srv2022 share paths.
-        # IS_GUEST for 3.0+ (VALIDATE_NEGOTIATE bypass), none for 2.x
-        # (avoids AllowInsecureGuestAccess rejection)
+        # IS_GUEST for 3.0+ (VALIDATE_NEGOTIATE signing bypass for
+        # Win8.1/Srv2012R2), none for 2.x (avoids AllowInsecureGuestAccess
+        # rejection on Win10+).
         if (
             error_code == nt_errors.STATUS_SUCCESS
             and self.smb2_selected_dialect >= smb2.SMB2_DIALECT_30
