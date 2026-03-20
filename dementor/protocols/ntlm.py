@@ -939,12 +939,15 @@ def NTLM_handle_authenticate_message(
     extras: dict[str, Any] | None = None,
     transport: str = NTLM_TRANSPORT_NTLMSSP,
     negotiate_fields: dict[str, str] | None = None,
-) -> None:
+) -> bool:
     """Extract all crackable hashes from an AUTHENTICATE_MESSAGE and log them.
 
     Top-level entry point called by protocol handlers (SMB, HTTP, LDAP).
     Extracts every valid hashcat line (NetNTLMv2 + LMv2, or NetNTLMv1/NetNTLMv1-ESS)
     and writes each as a separate entry to the session capture database.
+
+    :return: ``True`` if credentials were captured, ``False`` if the
+        authentication was anonymous or no hashes could be extracted
 
     The NTLM display line is the deduped union of NEGOTIATE (Type 1) and
     AUTHENTICATE (Type 3) fields, plus the NTLMv2 blob SPN.  Type 3 fields
@@ -977,7 +980,7 @@ def NTLM_handle_authenticate_message(
     if _is_anonymous_authenticate(auth_token):
         method = log.display if logger else log.debug
         method("Anonymous NTLM login attempt; skipping hash extraction")
-        return
+        return False
 
     # -- AUTHENTICATE_MESSAGE parsed fields (single debug line) ------------
     os_str: str = _decode_ntlmssp_os_version(auth_token)
@@ -1041,7 +1044,7 @@ def NTLM_handle_authenticate_message(
                 auth_token["user_name"],
                 negotiate_flags,
             )
-            return
+            return False
 
         # -- NTLMv2 client blob AV_PAIRs (single debug line) --------------
         spn = _log_ntlmv2_blob(auth_token, log)
@@ -1106,6 +1109,8 @@ def NTLM_handle_authenticate_message(
                 extras=extras,
             )
 
+        return bool(all_hashes)
+
     except ValueError:
         log.exception(
             "Invalid data in AUTHENTICATE_MESSAGE (bad challenge length or "
@@ -1113,6 +1118,8 @@ def NTLM_handle_authenticate_message(
         )
     except Exception:
         log.exception("Failed to extract NTLM hashes from AUTHENTICATE_MESSAGE")
+
+    return False
 
 
 # --- Hash Formatting ---------------------------------------------------------

