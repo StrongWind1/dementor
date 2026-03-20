@@ -1256,16 +1256,13 @@ class SMBHandler(BaseProtoHandler):
 
         # Select the best dialect for credential capture.
         #
-        # For share-path capture, the strategy is dialect-dependent:
-        # - Clients whose max is 3.0.2 (Win8.1, Srv2012R2): negotiate
-        #   3.0.2 and use IS_GUEST to bypass VALIDATE_NEGOTIATE signing.
-        # - Clients that support 3.1.1 (Win10+, Srv2016+): negotiate
-        #   2.1 to avoid both IS_GUEST rejection and preauth hash.
-        #   At 2.1, no VALIDATE_NEGOTIATE IOCTL exists, and without
-        #   IS_GUEST, AllowInsecureGuestAccess is not triggered.
+        # Clients that support 3.1.1 are downgraded to 2.1 to avoid the
+        # preauth integrity hash (which enforces session key derivation
+        # even when signing is disabled).  At 2.1, there's no
+        # VALIDATE_NEGOTIATE_INFO and no preauth hash.
         #
-        # The net effect: every client gets the highest dialect where
-        # share-path capture works, while still capturing all hash types.
+        # Clients whose max is 3.0.2 (Win8.1, Srv2012R2) get 3.0.2 with
+        # IS_GUEST to bypass VALIDATE_NEGOTIATE signing.
         cfg = self.smb_config
         valid_dialects = sorted(
             (
@@ -1276,9 +1273,6 @@ class SMBHandler(BaseProtoHandler):
             ),
             reverse=True,
         )
-        # If the client supports 3.1.1 and the server allows it,
-        # cap at 2.1 to enable share-path capture without IS_GUEST.
-        # Clients whose max is 3.0.2 are unaffected (they get 3.0.2).
         if (
             valid_dialects
             and valid_dialects[0] >= smb2.SMB2_DIALECT_311
@@ -1286,7 +1280,7 @@ class SMBHandler(BaseProtoHandler):
         ):
             dialect: int | None = smb2.SMB2_DIALECT_21
         elif valid_dialects:
-            dialect = valid_dialects[0]  # greatest common
+            dialect = valid_dialects[0]
         else:
             dialect = None
         if dialect is None:
@@ -1366,6 +1360,7 @@ class SMBHandler(BaseProtoHandler):
         #   IS_GUEST the client proceeds without signing checks.  This
         #   captures Win10/Srv2019/Srv2022 share paths.
         # IS_GUEST for 3.0+ (VALIDATE_NEGOTIATE bypass), none for 2.x
+        # (avoids AllowInsecureGuestAccess rejection)
         if (
             error_code == nt_errors.STATUS_SUCCESS
             and self.smb2_selected_dialect >= smb2.SMB2_DIALECT_30
