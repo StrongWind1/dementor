@@ -31,7 +31,7 @@ from rich.console import Console
 # On a real TTY, Rich auto-detects the terminal width.
 _width: int | None = None
 if not sys.stdout.isatty():
-    _width = int(os.environ.get("COLUMNS", "400"))
+    _width = int(os.environ.get("COLUMNS", "200"))
 
 dm_console: Console = Console(
     soft_wrap=True,

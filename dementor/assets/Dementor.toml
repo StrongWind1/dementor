@@ -298,17 +298,6 @@ AllowSMB1Upgrade = true
 # SMB2MinDialect = "2.002"
 # SMB2MaxDialect = "3.1.1"
 
-# --- SMB Negotiate ---
-
-# When true, clears NEGOTIATE_ENCRYPT_PASSWORDS in SMB1 non-extended negotiate.
-# ChallengeLength becomes 0 and clients send cleartext passwords instead of hashes.
-# WARNING: All Windows NT4 SP3+ / 2000+ refuse plaintext by default. Only useful
-# for targeting legacy (NT4 base/SP2), misconfigured, or embedded/IoT clients.
-# Only affects SMB1 non-extended security. No effect on SMB1 extended or SMB2.
-# The default value is: false
-
-ForceSMB1Plaintext = false
-
 # --- SMB Identity ---
 
 # NetBIOS computer name — appears in SMB1 negotiate (non-extended path) and
@@ -331,12 +320,15 @@ NetBIOSDomain = "WORKGROUP"
 
 # --- Post-Auth ---
 
-# Number of credential captures per connection. After each capture except the
-# last, sends STATUS_ACCOUNT_DISABLED (0xC0000072) to trigger SSPI retry with
-# alternate cached credentials. Set to 1 to disable multi-credential capture.
-# The default value is: 2
+# Multi-credential capture per connection.  When > 0, the first N-1 captures
+# return STATUS_ACCOUNT_DISABLED (0xC0000072) to trigger SSPI retry with
+# alternate cached credentials.  The Nth capture returns STATUS_SUCCESS so
+# the client proceeds to TREE_CONNECT where the share path is captured.
+# When 0 (default), multi-cred retry is disabled and STATUS_SUCCESS is
+# returned immediately after the first capture.
+# The default value is: 0
 
-CapturesPerConnection = 2
+CapturesPerConnection = 0
 
 # NTSTATUS error code returned after the final credential capture.
 
