@@ -161,10 +161,12 @@ SMB2_DIALECT_STRINGS: dict[str, int] = {
 }
 
 # Realistic SMB2 server values per [MS-SMB2] §2.2.4 (Windows Server defaults)
-# 8 MB for direct TCP (port 445) — matches Windows Server 2012+ behaviour
-SMB2_MAX_TRANSACT_SIZE: int = 8_388_608
-SMB2_MAX_READ_SIZE: int = 8_388_608
-SMB2_MAX_WRITE_SIZE: int = 8_388_608
+# Per-dialect max sizes matching real Windows pcap behaviour:
+#   2.0.2: 65536 (64K) — matches Vista/Srv2008
+#   2.1:   1048576 (1M) or 8388608 (8M) — varies; use 8M for Server 2012+
+#   3.0+:  8388608 (8M) — matches Windows Server 2012+
+SMB2_MAX_SIZE_SMALL: int = 65_536  # SMB 2.0.2
+SMB2_MAX_SIZE_LARGE: int = 8_388_608  # SMB 2.1+
 
 # Realistic SMB2 capabilities — [MS-SMB2] §2.2.4
 # DFS(0x01) | Leasing(0x02) | LargeMTU(0x04) | MultiChannel(0x08)
@@ -172,8 +174,14 @@ SMB2_MAX_WRITE_SIZE: int = 8_388_608
 # We do NOT set Encryption(0x40) since we don't implement it.
 SMB2_SERVER_CAPABILITIES: int = 0x2F
 
-# Realistic SMB1 negotiate defaults per [MS-SMB] §2.2.4.5.2.1 <28> /
-# [MS-CIFS] §2.2.4.52.2
+# Realistic SMB1 negotiate capabilities per [MS-CIFS] §2.2.4.52.2
+# Matching real Windows 7+ pcap (0x8001e3fc without CAP_EXTENDED_SECURITY):
+#   UNICODE(0x04) | LARGE_FILES(0x08) | NT_SMBS(0x10) | RPC_REMOTE_APIS(0x20) |
+#   STATUS32(0x40) | LEVEL_II_OPLOCKS(0x80) | LOCK_AND_READ(0x100) |
+#   NT_FIND(0x200) | INFOLEVEL_PASSTHRU(0x2000) | LARGE_READX(0x4000) |
+#   LARGE_WRITEX(0x8000) | LWIO(0x10000)
+SMB1_CAPABILITIES_BASE: int = 0x0001E3FC
+
 SMB1_MAX_MPX_COUNT: int = 50
 SMB1_MAX_BUFFER_SIZE: int = 16644
 
@@ -436,6 +444,12 @@ class SMBHandler(BaseProtoHandler):
         # Selected SMB2 dialect for this connection, set during negotiate.
         # Used by FSCTL_VALIDATE_NEGOTIATE_INFO. [MS-SMB2] §3.3.5.15.12
         self.smb2_selected_dialect: int = 0
+        # Client signing requirement from SMB2 NEGOTIATE SecurityMode
+        # bit 0x0002.  Future-proofing for Win11 24H2+ / Server 2025.
+        self.smb2_client_signing_required: bool = False
+        # Highest dialect the client offered (uncapped).  Used with
+        # signing_required to decide IS_GUEST strategy.
+        self.smb2_client_max_dialect: int = 0
         # Tracks how many credential captures have occurred on this
         # connection. Used to implement multi-credential capture: after
         # each capture (except the last), the server returns
@@ -450,21 +464,33 @@ class SMBHandler(BaseProtoHandler):
         # deduped union of Type 1 + Type 3.  This is ntlm.py's own output
         # passed through — smb.py never reads or modifies it.
         self.ntlm_negotiate_fields: dict[str, str] = {}
+        # Sequential file ID counters for fake file handles.
+        # SMB1 FIDs are 16-bit; SMB2 FileIDs are 64-bit volatile IDs.
+        self.smb1_fid_counter: int = 0
+        self.smb2_file_id_counter: int = 0
 
         self.smb1_commands: dict[int, typing.Any] = {
             smb.SMB.SMB_COM_NEGOTIATE: self.handle_smb1_negotiate,
             smb.SMB.SMB_COM_SESSION_SETUP_ANDX: self.handle_smb1_session_setup,
             smb.SMB.SMB_COM_TREE_CONNECT_ANDX: self.handle_smb1_tree_connect,
             smb.SMB.SMB_COM_LOGOFF_ANDX: self.handle_smb1_logoff,
+            smb.SMB.SMB_COM_CLOSE: self.handle_smb1_close,
+            smb.SMB.SMB_COM_READ_ANDX: self.handle_smb1_read,
+            smb.SMB.SMB_COM_TRANSACTION2: self.handle_smb1_trans2,
+            smb.SMB.SMB_COM_TREE_DISCONNECT: self.handle_smb1_tree_disconnect,
+            smb.SMB.SMB_COM_NT_CREATE_ANDX: self.handle_smb1_nt_create,
         }
         self.smb2_commands: dict[int, typing.Any] = {
             smb2.SMB2_NEGOTIATE: self.handle_smb2_negotiate,
             smb2.SMB2_SESSION_SETUP: self.handle_smb2_session_setup,
             smb2.SMB2_LOGOFF: self.handle_smb2_logoff,
             smb2.SMB2_TREE_CONNECT: self.handle_smb2_tree_connect,
-            smb2.SMB2_IOCTL: self.handle_smb2_ioctl,
+            smb2.SMB2_TREE_DISCONNECT: self.handle_smb2_tree_disconnect,
             smb2.SMB2_CREATE: self.handle_smb2_create,
             smb2.SMB2_CLOSE: self.handle_smb2_close,
+            smb2.SMB2_READ: self.handle_smb2_read,
+            smb2.SMB2_IOCTL: self.handle_smb2_ioctl,
+            smb2.SMB2_QUERY_DIRECTORY: self.handle_smb2_query_directory,
         }
         super().__init__(config, request, client_address, server)
 
@@ -742,8 +768,18 @@ class SMBHandler(BaseProtoHandler):
                 status=nt_errors.STATUS_NOT_SUPPORTED,
             )
         else:
-            self.logger.debug(f"C: {title} (unhandled)")
-            raise BaseProtoHandler.TerminateConnection
+            # Unhandled SMB1 command — respond with STATUS_NOT_IMPLEMENTED
+            # instead of dropping the connection.  Keeps the session alive
+            # so the client can proceed with file operations.
+            # [MS-CIFS] §3.3.5: error response for unsupported commands
+            self.logger.debug(f"C: {title} (unhandled, returning NOT_IMPLEMENTED)")
+            self.send_smb1_command(
+                command,
+                b"",
+                b"",
+                packet,
+                error_code=nt_errors.STATUS_NOT_IMPLEMENTED,
+            )
 
     # -- Logging --
 
@@ -1121,10 +1157,16 @@ class SMBHandler(BaseProtoHandler):
         command["ServerGuid"] = self.server.server_guid  # type: ignore[union-attr]
         # Realistic capabilities — [MS-SMB2] §2.2.4
         command["Capabilities"] = SMB2_SERVER_CAPABILITIES
-        # Realistic max sizes for direct TCP — [MS-SMB2] §2.2.4
-        command["MaxTransactSize"] = SMB2_MAX_TRANSACT_SIZE
-        command["MaxReadSize"] = SMB2_MAX_READ_SIZE
-        command["MaxWriteSize"] = SMB2_MAX_WRITE_SIZE
+        # Per-dialect max sizes matching real Windows pcap behaviour:
+        # 2.0.2 → 64K, 2.1+ → 8M (direct TCP, port 445)
+        max_size = (
+            SMB2_MAX_SIZE_SMALL
+            if target_revision == smb2.SMB2_DIALECT_002
+            else SMB2_MAX_SIZE_LARGE
+        )
+        command["MaxTransactSize"] = max_size
+        command["MaxReadSize"] = max_size
+        command["MaxWriteSize"] = max_size
         # [MS-SMB2] §2.2.4: SystemTime set to current time in FILETIME format
         command["SystemTime"] = get_server_time()
         # [MS-SMB2] §3.3.5.4: ServerStartTime SHOULD be zero <286>
@@ -1254,12 +1296,14 @@ class SMBHandler(BaseProtoHandler):
                 f"C: SMB2_NEGOTIATE: Dialects={str_req_dialects}",
             )
 
-        # Select the best dialect for credential and share-path capture.
+        # Select the highest common dialect within the configured range.
+        # No adaptive downgrade — negotiate at the client's native dialect.
         #
-        # Clients that support 3.1.1 are downgraded to 2.1 to avoid the
-        # preauth integrity hash and AllowInsecureGuestAccess rejection.
-        # Clients whose max is 3.0.2 (Win8.1, Srv2012R2) get their
-        # native 3.0.2 + IS_GUEST to bypass VALIDATE_NEGOTIATE signing.
+        # At 3.1.1, hash capture works but the client disconnects after
+        # SESSION_SETUP without sending TREE_CONNECT because the spec
+        # requires signed responses (which need a session key derived from
+        # the user's password hash, which a capture server doesn't have).
+        # Share path and filename capture is not possible at 3.1.1.
         cfg = self.smb_config
         valid_dialects = sorted(
             (
@@ -1270,16 +1314,7 @@ class SMBHandler(BaseProtoHandler):
             ),
             reverse=True,
         )
-        if (
-            valid_dialects
-            and valid_dialects[0] >= smb2.SMB2_DIALECT_311
-            and smb2.SMB2_DIALECT_21 in valid_dialects
-        ):
-            dialect: int | None = smb2.SMB2_DIALECT_21
-        elif valid_dialects:
-            dialect = valid_dialects[0]
-        else:
-            dialect = None
+        dialect: int | None = valid_dialects[0] if valid_dialects else None
         if dialect is None:
             self.logger.fail(f"Client requested unsupported dialects: {str_req_dialects}")
             # [MS-SMB2] §3.3.5.4: respond with STATUS_NOT_SUPPORTED.
@@ -1294,10 +1329,32 @@ class SMBHandler(BaseProtoHandler):
 
         command = self._build_smb2_negotiate_response(dialect, req)
         self.smb2_selected_dialect = dialect
-        self.client_info["smb_dialect"] = SMB2_DIALECTS.get(dialect, hex(dialect))
-        self.logger.debug(
-            f"S: <SMB2_NEGOTIATE> selected dialect: {SMB2_DIALECTS.get(dialect, hex(dialect))}",
-        )
+        # [MS-SMB2] §2.2.3: SecurityMode bit 0x0002 = SIGNING_REQUIRED
+        try:
+            self.smb2_client_signing_required = bool(req["SecurityMode"] & 0x0002)
+        except Exception:
+            self.smb2_client_signing_required = False
+        # Client's highest offered dialect (uncapped by our MaxDialect)
+        client_negotiable = [d for d in req_dialects if d in SMB2_NEGOTIABLE_DIALECTS]
+        self.smb2_client_max_dialect = max(client_negotiable) if client_negotiable else 0
+        dialect_name = SMB2_DIALECTS.get(dialect, hex(dialect))
+        self.client_info["smb_dialect"] = dialect_name
+        self.logger.debug(f"S: <SMB2_NEGOTIATE> selected dialect: {dialect_name}")
+
+        if dialect == smb2.SMB2_DIALECT_311:
+            # [MS-SMB2] §3.2.5.3.1: at 3.1.1 the client requires signed
+            # SESSION_SETUP responses.  Signing needs a session key derived
+            # from the user's password hash, which a capture server does
+            # not have.  Hash capture still works (the AUTHENTICATE_MESSAGE
+            # arrives before the signed response is validated), but the
+            # client will disconnect after auth — no TREE_CONNECT, CREATE,
+            # or READ follows, so share path and filename capture is not
+            # possible.
+            self.logger.info(
+                "SMB 3.1.1: hash capture OK, but path/filename capture "
+                "unavailable (client requires signed responses)"
+            )
+
         self.send_smb2_command(command.getData())
 
     def handle_smb2_session_setup(self, packet: smb2.SMB2Packet) -> None:
@@ -1336,34 +1393,43 @@ class SMBHandler(BaseProtoHandler):
         command["SecurityBufferOffset"] = 0x48
         command["Buffer"] = resp_token
 
-        # [MS-SMB2] §2.2.6: SessionFlags — always set IS_GUEST (0x0001)
-        # so the client sets Session.SigningRequired=FALSE per §3.2.5.3.1.
-        # This prevents the client from requiring signed responses for
-        # VALIDATE_NEGOTIATE_INFO and other post-auth commands.
+        # [MS-SMB2] §2.2.6 / §3.2.5.3.1: IS_GUEST (0x0001) sets
+        # Session.SigningRequired=FALSE on the client, so unsigned
+        # responses (including VALIDATE_NEGOTIATE_INFO) are accepted.
         #
-        # Clients that reject IS_GUEST (Win10 1709+ with
-        # AllowInsecureGuestAccess=FALSE) will RST regardless of dialect
-        # or signing settings — confirmed by exhaustive 63-permutation
-        # fuzz at 3.1.1.  IS_GUEST is the best option for all others.
-        # [MS-SMB2] §2.2.6: SessionFlags — dialect-dependent strategy.
+        # Three-tier decision using SIGNING_REQUIRED + client max dialect:
         #
-        # SMB 3.0+: IS_GUEST disables signing so the unsigned
-        #   VALIDATE_NEGOTIATE_INFO response is accepted.  Win10 1709+
-        #   rejects IS_GUEST (AllowInsecureGuestAccess=FALSE) but
-        #   Win8.1/Srv2012R2/Srv2016 accept it.
+        #   1. SIGNING_REQUIRED set → never IS_GUEST
+        #      §3.2.5.3.1: IS_GUEST + SigningRequired = client MUST fail.
+        #      Future-proofing for Win11 24H2+ / Server 2025.
         #
-        # SMB 2.x: NO IS_GUEST avoids AllowInsecureGuestAccess rejection.
-        #   At 2.x there's no VALIDATE_NEGOTIATE_INFO IOCTL, and without
-        #   IS_GUEST the client proceeds without signing checks.  This
-        #   captures Win10/Srv2019/Srv2022 share paths.
-        # IS_GUEST for 3.0+ (VALIDATE_NEGOTIATE signing bypass for
-        # Win8.1/Srv2012R2), none for 2.x (avoids AllowInsecureGuestAccess
-        # rejection on Win10+).
-        if (
-            error_code == nt_errors.STATUS_SUCCESS
-            and self.smb2_selected_dialect >= smb2.SMB2_DIALECT_30
-        ):
-            command["SessionFlags"] = 0x0001  # SMB2_SESSION_FLAG_IS_GUEST
+        #   2. Client max dialect ≤ 3.0.2 → IS_GUEST
+        #      These clients (Win8.1, Srv2012R2, Srv2016) have
+        #      AllowInsecureGuestAccess=TRUE → IS_GUEST accepted → ✓
+        #
+        #   3. Client max dialect ≥ 3.1.1 → no IS_GUEST
+        #      These clients (Win10, Win11, Srv2019, Srv2022) have
+        #      AllowInsecureGuestAccess=FALSE → IS_GUEST rejected → H.
+        #      Without IS_GUEST at 2.x they get P (path from
+        #      TREE_CONNECT before VALIDATE_NEGOTIATE RST).
+        if error_code == nt_errors.STATUS_SUCCESS:
+            if self.smb2_client_signing_required:
+                self.logger.info(
+                    "SMB %s: no IS_GUEST (client requires signing)",
+                    SMB2_DIALECTS.get(self.smb2_selected_dialect, "SMB2"),
+                )
+            elif self.smb2_client_max_dialect <= smb2.SMB2_DIALECT_302:
+                command["SessionFlags"] = 0x0001  # SMB2_SESSION_FLAG_IS_GUEST
+                self.logger.info(
+                    "SMB %s: IS_GUEST set (client max ≤3.0.2, signing not required)",
+                    SMB2_DIALECTS.get(self.smb2_selected_dialect, "SMB2"),
+                )
+            else:
+                self.logger.info(
+                    "SMB %s: no IS_GUEST (client max ≥3.1.1, "
+                    "AllowInsecureGuestAccess likely FALSE)",
+                    SMB2_DIALECTS.get(self.smb2_selected_dialect, "SMB2"),
+                )
 
         self.send_smb2_command(
             command.getData(),
@@ -1414,17 +1480,47 @@ class SMBHandler(BaseProtoHandler):
             )
         return ""
 
+    def _send_smb2_tree_connect_response(
+        self, packet: smb2.SMB2Packet, resp: typing.Any, tree_id: int
+    ) -> None:
+        """Send an SMB2 TREE_CONNECT response with a server-assigned TreeID.
+
+        Uses manual SMB2Packet construction rather than :meth:`send_smb2_command`
+        because the TreeID in the response must be the server-assigned value,
+        not the echoed value from the request.
+
+        :param packet: The original TREE_CONNECT request
+        :type packet: smb2.SMB2Packet
+        :param resp: The populated SMB2TreeConnect_Response structure
+        :type resp: typing.Any
+        :param tree_id: Server-assigned TreeID for this tree connect
+        :type tree_id: int
+        """
+        smb2_resp = smb2.SMB2Packet()
+        smb2_resp["Flags"] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
+        smb2_resp["Status"] = nt_errors.STATUS_SUCCESS
+        smb2_resp["Command"] = packet["Command"]
+        smb2_resp["CreditCharge"] = packet["CreditCharge"]
+        smb2_resp["Reserved"] = packet["Reserved"]
+        smb2_resp["SessionID"] = self.smb2_session_id
+        smb2_resp["MessageID"] = packet["MessageID"]
+        smb2_resp["TreeID"] = tree_id
+        smb2_resp["CreditRequestResponse"] = 1
+        smb2_resp["Data"] = resp.getData()
+        self.send_data(smb2_resp.getData())
+
     def handle_smb2_tree_connect(self, packet: smb2.SMB2Packet) -> None:
         r"""SMB2 TREE_CONNECT handler -- [MS-SMB2] §3.3.5.7.
 
-        Implements a two-phase tree connect strategy:
+        Accepts all tree connects to simulate a real SMB file server:
 
-        1. **IPC$** tree connects are accepted with ``STATUS_SUCCESS`` so
-           the client can proceed (it needs IPC$ for DFS referral queries
-           before connecting to the real share).
-        2. **Non-IPC$** tree connects capture the actual share path
-           (e.g. ``\\\\10.0.0.50\\SHARENAME``) and return the configured
-           :attr:`ErrorCode` to end the session.
+        - **IPC$**: accepted as ``SMB2_SHARE_TYPE_PIPE`` so the client
+          can issue DFS referral / srvsvc queries before connecting to
+          the real share.
+        - **Non-IPC$**: accepted as ``SMB2_SHARE_TYPE_DISK`` so the
+          client proceeds to CREATE / READ / CLOSE, allowing filename
+          capture.  The share path (e.g. ``\\\\10.0.0.50\\share``) is
+          recorded in :attr:`client_info`.
 
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
@@ -1443,46 +1539,32 @@ class SMBHandler(BaseProtoHandler):
         # Extract share name from UNC path (\\server\share → share)
         share_name = path.rsplit("\\", 1)[-1].upper() if path else ""
 
+        self.smb2_tree_id_counter += 1
         resp = smb2.SMB2TreeConnect_Response()
         resp["Capabilities"] = 0
         resp["MaximalAccess"] = 0x001F01FF  # FILE_ALL_ACCESS
 
         if share_name == "IPC$":
-            # Accept IPC$ so client can issue DFS referral / srvsvc
-            # queries, then tree-connect to the real share.
-            self.smb2_tree_id_counter += 1
             resp["ShareType"] = 0x02  # SMB2_SHARE_TYPE_PIPE
             resp["ShareFlags"] = 0x00000030  # NO_CACHING
             self.logger.debug(
                 "S: SMB2_TREE_CONNECT IPC$ accepted (TreeId=%d)",
                 self.smb2_tree_id_counter,
             )
-            # Override the echoed TreeID with our allocated one
-            smb2_resp = smb2.SMB2Packet()
-            smb2_resp["Flags"] = smb2.SMB2_FLAGS_SERVER_TO_REDIR
-            smb2_resp["Status"] = nt_errors.STATUS_SUCCESS
-            smb2_resp["Command"] = packet["Command"]
-            smb2_resp["CreditCharge"] = packet["CreditCharge"]
-            smb2_resp["Reserved"] = packet["Reserved"]
-            smb2_resp["SessionID"] = self.smb2_session_id
-            smb2_resp["MessageID"] = packet["MessageID"]
-            smb2_resp["TreeID"] = self.smb2_tree_id_counter
-            smb2_resp["CreditRequestResponse"] = 1
-            smb2_resp["Data"] = resp.getData()
-            self.send_data(smb2_resp.getData())
         else:
-            # Non-IPC$ share — capture the path, return configured error
+            # Non-IPC$ disk share — capture the path for intelligence
             if path:
                 self.client_info["smb_path"] = path
-            error_code = self.smb_config.smb_error_code
+            resp["ShareType"] = 0x01  # SMB2_SHARE_TYPE_DISK
+            # [MS-SMB2] §2.2.10: 0 = default caching (matches real Windows)
+            resp["ShareFlags"] = 0x00000000
             self.logger.debug(
-                "S: ErrorCode=0x%08x (tree connect reject, path=%s)",
-                error_code,
+                "S: SMB2_TREE_CONNECT share accepted (TreeId=%d, path=%s)",
+                self.smb2_tree_id_counter,
                 path,
             )
-            resp["ShareType"] = 0x01  # SMB2_SHARE_TYPE_DISK
-            resp["ShareFlags"] = 0x00000000
-            self.send_smb2_command(resp.getData(), packet, status=error_code)
+
+        self._send_smb2_tree_connect_response(packet, resp, self.smb2_tree_id_counter)
 
     def _smb2_error_response(self, packet: smb2.SMB2Packet, status: int) -> None:
         """Send a spec-compliant SMB2 error response.
@@ -1589,15 +1671,17 @@ class SMBHandler(BaseProtoHandler):
     def handle_smb2_create(self, packet: smb2.SMB2Packet) -> None:
         """SMB2 CREATE handler -- [MS-SMB2] §3.3.5.9.
 
-        Clients may try to open named pipes (e.g. ``srvsvc``) on IPC$
-        before tree-connecting to the real share.  Returns
-        ``STATUS_OBJECT_NAME_NOT_FOUND`` per [MS-SMB2] §3.3.5.9 to
-        indicate the file/pipe doesn't exist without dropping the
-        connection.
+        Returns a fake FileId with ``STATUS_SUCCESS`` so the client
+        proceeds to READ / QUERY_DIRECTORY, allowing filename capture.
+        The ``CreateAction`` is ``FILE_OPENED`` (1) and timestamps are
+        set to the current server time.  Empty names (directory opens)
+        get ``FILE_ATTRIBUTE_DIRECTORY``; all others get
+        ``FILE_ATTRIBUTE_NORMAL``.
 
         :param packet: Parsed SMB2 packet from the client
         :type packet: smb2.SMB2Packet
         """
+        name = ""
         try:
             req = smb2.SMB2Create(packet["Data"])
             name_offset = req["NameOffset"] - 64
@@ -1607,14 +1691,46 @@ class SMBHandler(BaseProtoHandler):
                 name = raw[name_offset : name_offset + name_length].decode(
                     "utf-16-le", errors="replace"
                 )
-            else:
-                name = "(empty)"
-            self.logger.debug("C: SMB2_CREATE Name=%s", name)
+            self.logger.debug("C: SMB2_CREATE Name=%s", name or "(empty)")
         except Exception:
             self.logger.debug("C: SMB2_CREATE (malformed)")
 
-        # [MS-SMB2] §2.2.2: Error response for file not found
-        self._smb2_error_response(packet, nt_errors.STATUS_OBJECT_NAME_NOT_FOUND)
+        # Allocate a sequential volatile FileId
+        self.smb2_file_id_counter += 1
+        now = get_server_time()
+        is_dir = name == ""
+
+        resp = smb2.SMB2Create_Response()
+        resp["OplockLevel"] = 0  # SMB2_OPLOCK_LEVEL_NONE
+        resp["Flags"] = 0
+        resp["CreateAction"] = smb2.FILE_OPENED  # 0x01
+        resp["CreationTime"] = now
+        resp["LastAccessTime"] = now
+        resp["LastWriteTime"] = now
+        resp["ChangeTime"] = now
+        resp["AllocationSize"] = 0
+        resp["EndOfFile"] = 0
+        # [MS-FSCC] §2.6: DIRECTORY (0x10) or ARCHIVE (0x20) per real Windows
+        resp["FileAttributes"] = (
+            smb2.FILE_ATTRIBUTE_DIRECTORY if is_dir else smb2.FILE_ATTRIBUTE_ARCHIVE
+        )
+        resp["Reserved2"] = 0
+
+        file_id = smb2.SMB2_FILEID()
+        file_id["Persistent"] = 0xFFFFFFFFFFFFFFFF
+        file_id["Volatile"] = self.smb2_file_id_counter
+        resp["FileID"] = file_id
+
+        resp["CreateContextsOffset"] = 0
+        resp["CreateContextsLength"] = 0
+        resp["Buffer"] = b"\x00"
+
+        self.logger.debug(
+            "S: SMB2_CREATE FileId=0x%x IsDir=%s",
+            self.smb2_file_id_counter,
+            is_dir,
+        )
+        self.send_smb2_command(resp.getData(), packet)
 
     def handle_smb2_close(self, packet: smb2.SMB2Packet) -> None:
         """SMB2 CLOSE handler -- [MS-SMB2] §3.3.5.10.
@@ -1628,6 +1744,67 @@ class SMBHandler(BaseProtoHandler):
         self.logger.debug("C: SMB2_CLOSE")
         # SMB2Close_Response has all zeros for timestamps/sizes — spec-compliant
         resp = smb2.SMB2Close_Response()
+        self.send_smb2_command(resp.getData(), packet)
+
+    def handle_smb2_read(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 READ handler -- [MS-SMB2] §3.3.5.12.
+
+        Returns ``STATUS_END_OF_FILE`` for all read requests.  The fake
+        files created by :meth:`handle_smb2_create` have zero size, so
+        any read attempt hits EOF immediately.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
+        try:
+            req = smb2.SMB2Read(packet["Data"])
+            file_id = smb2.SMB2_FILEID(req["FileID"].getData())
+            self.logger.debug(
+                "C: SMB2_READ FileId=0x%x Offset=%d Length=%d",
+                file_id["Volatile"],
+                req["Offset"],
+                req["Length"],
+            )
+        except Exception:
+            self.logger.debug("C: SMB2_READ (malformed)")
+        self._smb2_error_response(packet, nt_errors.STATUS_END_OF_FILE)
+
+    def handle_smb2_query_directory(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 QUERY_DIRECTORY handler -- [MS-SMB2] §3.3.5.18.
+
+        Returns ``STATUS_NO_MORE_FILES`` for all directory queries.
+        The fake directories are empty, so enumeration returns no
+        entries immediately.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
+        try:
+            req = smb2.SMB2QueryDirectory(packet["Data"])
+            name_offset = req["FileNameOffset"] - 64
+            name_length = req["FileNameLength"]
+            raw = packet["Data"]
+            pattern = "*"
+            if name_length > 0 and 0 <= name_offset < len(raw):
+                end = min(name_offset + name_length, len(raw))
+                pattern = raw[name_offset:end].decode("utf-16-le", errors="replace")
+            self.logger.debug("C: SMB2_QUERY_DIRECTORY Pattern=%s", pattern)
+        except Exception:
+            self.logger.debug("C: SMB2_QUERY_DIRECTORY (malformed)")
+        self._smb2_error_response(packet, nt_errors.STATUS_NO_MORE_FILES)
+
+    def handle_smb2_tree_disconnect(self, packet: smb2.SMB2Packet) -> None:
+        """SMB2 TREE_DISCONNECT handler -- [MS-SMB2] §3.3.5.8.
+
+        Acknowledges tree disconnect requests.  Per [MS-SMB2] §2.2.12,
+        the response is a 4-byte structure with only StructureSize and
+        Reserved.
+
+        :param packet: Parsed SMB2 packet from the client
+        :type packet: smb2.SMB2Packet
+        """
+        self.logger.debug("C: SMB2_TREE_DISCONNECT TreeId=%d", packet["TreeID"])
+        resp = smb2.SMB2TreeDisconnect_Response()
         self.send_smb2_command(resp.getData(), packet)
 
     # -- SMB1 command handlers --
@@ -1748,11 +1925,9 @@ class SMBHandler(BaseProtoHandler):
             _dialects_data["SecurityBlob"] = blob.getData()
 
             _dialects_parameters = smb.SMBExtended_Security_Parameters()
+            # Realistic capabilities matching Windows 7+ pcap (0x8001e3fc)
             _dialects_parameters["Capabilities"] = (
-                smb.SMB.CAP_EXTENDED_SECURITY
-                | smb.SMB.CAP_USE_NT_ERRORS
-                | smb.SMB.CAP_NT_SMBS
-                | smb.SMB.CAP_UNICODE
+                smb.SMB.CAP_EXTENDED_SECURITY | SMB1_CAPABILITIES_BASE
             )
             _dialects_parameters["ChallengeLength"] = 0
         else:
@@ -1779,10 +1954,8 @@ class SMBHandler(BaseProtoHandler):
             _dialects_parameters["ChallengeLength"] = 8
             _dialects_data["Challenge"] = cfg.ntlm_challenge
 
-            # Capabilities — NO CAP_EXTENDED_SECURITY
-            _dialects_parameters["Capabilities"] = (
-                smb.SMB.CAP_USE_NT_ERRORS | smb.SMB.CAP_NT_SMBS | smb.SMB.CAP_UNICODE
-            )
+            # Realistic capabilities matching Windows pcap — NO CAP_EXTENDED_SECURITY
+            _dialects_parameters["Capabilities"] = SMB1_CAPABILITIES_BASE
 
             # DomainName and ServerName — [MS-CIFS] §2.2.4.52.2
             # Payload is the raw concatenation of DomainName + ServerName;
@@ -2139,16 +2312,14 @@ class SMBHandler(BaseProtoHandler):
         raise BaseProtoHandler.TerminateConnection
 
     def handle_smb1_tree_connect(self, packet: smb.NewSMBPacket) -> None:
-        r"""SMB1 TREE_CONNECT_ANDX handler.
+        r"""SMB1 TREE_CONNECT_ANDX handler -- [MS-CIFS] §2.2.4.55.
 
-        Captures the requested share path (e.g.
-        ``\\\\server\\share``) for intelligence gathering, then returns
-        the configured :attr:`ErrorCode` to end the session.
+        Accepts all tree connects to simulate a real SMB file server:
 
-        The session setup returns STATUS_SUCCESS to keep the connection
-        alive so the client sends this TREE_CONNECT with the share path.
-
-        Spec: [MS-CIFS] §2.2.4.55, [MS-SMB] §3.3.5.4
+        - **IPC$**: accepted so the client can proceed to the real share.
+        - **Non-IPC$**: accepted so the client proceeds to NT_CREATE /
+          READ, allowing filename capture.  The share path is recorded
+          in :attr:`client_info`.
 
         :param packet: Parsed SMB1 packet from the client
         :type packet: smb.NewSMBPacket
@@ -2231,13 +2402,9 @@ class SMBHandler(BaseProtoHandler):
                 packet,
             )
         else:
-            # Non-IPC$ share — capture path, return configured error
-            error_code = self.smb_config.smb_error_code
-            self.logger.debug(
-                "S: ErrorCode=0x%08x (tree connect reject, path=%s)",
-                error_code,
-                path,
-            )
+            # Non-IPC$ disk share — accept so client proceeds to
+            # NT_CREATE / READ, allowing filename capture.
+            self.logger.debug("S: SMB1 TREE_CONNECT share accepted (path=%s)", path)
             resp_data["Service"] = b"A:\x00"
             resp_data["NativeFileSystem"] = smbserver.encodeSMBString(
                 packet["Flags2"], ""
@@ -2247,8 +2414,258 @@ class SMBHandler(BaseProtoHandler):
                 resp_data,
                 resp_params,
                 packet,
-                error_code=error_code,
             )
+
+    def handle_smb1_nt_create(self, packet: smb.NewSMBPacket) -> None:
+        """SMB1 NT_CREATE_ANDX handler -- [MS-SMB] §3.3.5.6.
+
+        Returns a fake FID with ``STATUS_SUCCESS`` so the client proceeds
+        to READ_ANDX, allowing filename capture.  Empty filenames (share
+        root opens) get ``FILE_ATTRIBUTE_DIRECTORY``; all others get
+        ``FILE_ATTRIBUTE_NORMAL``.
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        """
+        name = ""
+        try:
+            cmd = smb.SMBCommand(packet["Data"][0])
+            params = smb.SMBNtCreateAndX_Parameters(cmd["Parameters"])
+            file_name_length: int = params["FileNameLength"]
+            raw_data: bytes = cmd["Data"]
+            is_unicode = bool(packet["Flags2"] & smb.SMB.FLAGS2_UNICODE)
+
+            # [MS-SMB] §2.2.4.64.1: Unicode filenames have a 1-byte
+            # alignment pad before the filename.
+            if is_unicode:
+                # Pad byte at offset 0 to align FileName to word boundary
+                start = 1
+                end = min(start + file_name_length, len(raw_data))
+                name = (
+                    raw_data[start:end]
+                    .decode("utf-16-le", errors="replace")
+                    .rstrip("\x00")
+                )
+            else:
+                end = min(file_name_length, len(raw_data))
+                name = raw_data[:end].decode("ascii", errors="replace").rstrip("\x00")
+            self.logger.debug("C: SMB_COM_NT_CREATE_ANDX Name=%s", name or "(empty)")
+        except Exception:
+            self.logger.debug("C: SMB_COM_NT_CREATE_ANDX (malformed)")
+
+        # Allocate a sequential FID
+        self.smb1_fid_counter += 1
+        now = get_server_time()
+        is_dir = name == ""
+
+        resp_params = smb.SMBNtCreateAndXResponse_Parameters()
+        resp_params["OplockLevel"] = 0
+        resp_params["Fid"] = self.smb1_fid_counter
+        resp_params["CreateAction"] = 1  # FILE_OPENED
+        resp_params["CreateTime"] = now
+        resp_params["LastAccessTime"] = now
+        resp_params["LastWriteTime"] = now
+        resp_params["LastChangeTime"] = now
+        # [MS-FSCC] §2.6: DIRECTORY (0x10) or ARCHIVE (0x20) per real Windows
+        resp_params["FileAttributes"] = 0x10 if is_dir else 0x20
+        resp_params["AllocationSize"] = 0
+        resp_params["EndOfFile"] = 0
+        resp_params["FileType"] = 0
+        resp_params["IPCState"] = 0
+        resp_params["IsDirectory"] = 1 if is_dir else 0
+
+        self.logger.debug(
+            "S: SMB_COM_NT_CREATE_ANDX Fid=%d IsDir=%s",
+            self.smb1_fid_counter,
+            is_dir,
+        )
+        self.send_smb1_command(
+            smb.SMB.SMB_COM_NT_CREATE_ANDX,
+            b"",
+            resp_params,
+            packet,
+        )
+
+    def handle_smb1_read(self, packet: smb.NewSMBPacket) -> None:
+        """SMB1 READ_ANDX handler -- [MS-CIFS] §3.3.5.38.
+
+        Returns ``STATUS_END_OF_FILE`` for all read requests.  The fake
+        files have zero size, so any read hits EOF immediately.
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        """
+        try:
+            cmd = smb.SMBCommand(packet["Data"][0])
+            params = smb.SMBReadAndX_Parameters(cmd["Parameters"])
+            self.logger.debug(
+                "C: SMB_COM_READ_ANDX Fid=%d Offset=%d",
+                params["Fid"],
+                params["Offset"],
+            )
+        except Exception:
+            self.logger.debug("C: SMB_COM_READ_ANDX (malformed)")
+        self.send_smb1_command(
+            smb.SMB.SMB_COM_READ_ANDX,
+            b"",
+            b"",
+            packet,
+            error_code=nt_errors.STATUS_END_OF_FILE,
+        )
+
+    def handle_smb1_close(self, packet: smb.NewSMBPacket) -> None:
+        """SMB1 CLOSE handler -- [MS-CIFS] §3.3.5.27.
+
+        Acknowledges close requests.  ``SMB_COM_CLOSE`` is NOT an AndX
+        command — the response has zero parameter words and zero data
+        bytes.
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        """
+        try:
+            cmd = smb.SMBCommand(packet["Data"][0])
+            params = smb.SMBClose_Parameters(cmd["Parameters"])
+            self.logger.debug("C: SMB_COM_CLOSE Fid=%d", params["FID"])
+        except Exception:
+            self.logger.debug("C: SMB_COM_CLOSE (malformed)")
+        self.send_smb1_command(
+            smb.SMB.SMB_COM_CLOSE,
+            b"",
+            b"",
+            packet,
+        )
+
+    def _send_smb1_trans2_response(
+        self,
+        packet: smb.NewSMBPacket,
+        trans_parameters: bytes = b"",
+        trans_data: bytes = b"",
+        error_code: int | None = None,
+    ) -> None:
+        """Build and send a TRANS2 response with correct offset layout.
+
+        The TRANS2 response embeds sub-parameters and sub-data inside the
+        SMB data section with absolute offsets from the SMB header start.
+        Layout: SMBheader(32) + WordCount(1) + Words(20) + ByteCount(2)
+        = 55 bytes fixed.  Pad1(1) aligns trans_parameters to offset 56.
+
+        :param packet: The original TRANS2 request
+        :param trans_parameters: Subcommand-specific parameter bytes
+        :param trans_data: Subcommand-specific data bytes
+        :param error_code: NTSTATUS error code, or None for STATUS_SUCCESS
+        """
+        # Absolute offsets from SMB header start
+        # 32(hdr) + 1(WC) + 20(Words) + 2(BC) = 55
+        pad1 = b"\x00"  # align to even offset (55 → 56)
+        param_offset = 56 if trans_parameters else 0
+        param_len = len(trans_parameters)
+
+        # Pad2 between trans_parameters and trans_data (word-align)
+        pad2_len = (param_len % 2) if trans_data else 0
+        pad2 = b"\x00" * pad2_len
+        data_offset = (param_offset + param_len + pad2_len) if trans_data else 0
+        data_len = len(trans_data)
+
+        resp_params = smb.SMBTransaction2Response_Parameters()
+        resp_params["TotalParameterCount"] = param_len
+        resp_params["TotalDataCount"] = data_len
+        resp_params["ParameterCount"] = param_len
+        resp_params["ParameterOffset"] = param_offset
+        resp_params["ParameterDisplacement"] = 0
+        resp_params["DataCount"] = data_len
+        resp_params["DataOffset"] = data_offset
+        resp_params["DataDisplacement"] = 0
+        resp_params["SetupCount"] = 0
+        resp_params["Setup"] = b""
+
+        # Data = Pad1 + Trans_Parameters + Pad2 + Trans_Data
+        resp_data = pad1 + trans_parameters + pad2 + trans_data
+
+        self.send_smb1_command(
+            smb.SMB.SMB_COM_TRANSACTION2,
+            resp_data,
+            resp_params,
+            packet,
+            error_code=error_code,
+        )
+
+    def handle_smb1_trans2(self, packet: smb.NewSMBPacket) -> None:
+        """SMB1 TRANSACTION2 handler -- [MS-CIFS] §3.3.5.34.
+
+        Dispatches TRANS2 subcommands:
+
+        - ``TRANS2_QUERY_PATH_INFORMATION`` (0x0005): returns
+          ``STATUS_SUCCESS`` with ``SMBQueryFileBasicInfo`` (directory
+          attributes + timestamps) so SMB1 clients proceed to
+          NT_CREATE_ANDX.
+        - ``TRANS2_FIND_FIRST2`` (0x0001): ``STATUS_NO_MORE_FILES``
+        - Others: ``STATUS_NOT_IMPLEMENTED``
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        """
+        subcommand = -1
+        try:
+            cmd = smb.SMBCommand(packet["Data"][0])
+            trans2_params = smb.SMBTransaction2_Parameters(cmd["Parameters"])
+            setup_data: bytes = trans2_params["Setup"]
+            if len(setup_data) >= 2:
+                subcommand = int.from_bytes(setup_data[:2], "little")
+            self.logger.debug("C: SMB_COM_TRANSACTION2 Subcommand=0x%04x", subcommand)
+        except Exception:
+            self.logger.debug("C: SMB_COM_TRANSACTION2 (malformed)")
+
+        if subcommand == smb.SMB.TRANS2_QUERY_PATH_INFORMATION:
+            # [MS-CIFS] §2.2.6.6.2: return basic file info so the client
+            # proceeds to NT_CREATE_ANDX.  EaErrorOffset=0 as parameter,
+            # SMBQueryFileBasicInfo (40 bytes) as data.
+            now = get_server_time()
+            file_info = smb.SMBQueryFileBasicInfo()
+            file_info["CreationTime"] = now
+            file_info["LastAccessTime"] = now
+            file_info["LastWriteTime"] = now
+            file_info["LastChangeTime"] = now
+            file_info["ExtFileAttributes"] = 0x10  # FILE_ATTRIBUTE_DIRECTORY
+
+            # Trans2 parameter for QUERY_PATH_INFO response: EaErrorOffset(2)
+            ea_error = b"\x00\x00"
+            self._send_smb1_trans2_response(
+                packet,
+                trans_parameters=ea_error,
+                trans_data=file_info.getData(),
+            )
+        elif subcommand == smb.SMB.TRANS2_FIND_FIRST2:
+            self._send_smb1_trans2_response(
+                packet,
+                error_code=nt_errors.STATUS_NO_MORE_FILES,
+            )
+        else:
+            self.send_smb1_command(
+                smb.SMB.SMB_COM_TRANSACTION2,
+                b"",
+                b"",
+                packet,
+                error_code=nt_errors.STATUS_NOT_IMPLEMENTED,
+            )
+
+    def handle_smb1_tree_disconnect(self, packet: smb.NewSMBPacket) -> None:
+        """SMB1 TREE_DISCONNECT handler -- [MS-CIFS] §3.3.5.29.
+
+        Acknowledges tree disconnect requests.  ``SMB_COM_TREE_DISCONNECT``
+        is NOT an AndX command — the response has zero parameter words
+        and zero data bytes.
+
+        :param packet: Parsed SMB1 packet from the client
+        :type packet: smb.NewSMBPacket
+        """
+        self.logger.debug("C: SMB_COM_TREE_DISCONNECT Tid=%d", packet["Tid"])
+        self.send_smb1_command(
+            smb.SMB.SMB_COM_TREE_DISCONNECT,
+            b"",
+            b"",
+            packet,
+        )
 
 
 # --- Server ------------------------------------------------------------------
