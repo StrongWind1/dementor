@@ -36,7 +36,8 @@ set -euo pipefail
 
 # Files allowed to have the executable bit (mode 100755).
 EXEC_ALLOWLIST=(
-  # "scripts/deploy.sh"
+  ".githooks/check-hygiene.sh"
+  ".githooks/pre-commit"
 )
 
 # Paths exempt from the ASCII-only encoding check (Rule 3).

@@ -39,7 +39,8 @@ set -euo pipefail
 # This list is intentionally empty.  If you add a shell script that
 # genuinely needs +x, add its repo-relative path here AND in the CI script.
 EXEC_ALLOWLIST=(
-  # "scripts/deploy.sh"
+  ".githooks/check-hygiene.sh"
+  ".githooks/pre-commit"
 )
 
 # Paths exempt from the ASCII-only encoding check (Rule 3).
