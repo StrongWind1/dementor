@@ -42,7 +42,6 @@
 # configuration for a protocol can be placed under an extra section named
 # [[PROTOCOL.Server]].
 
-
 # =============================================================================
 # Main Configuration
 # =============================================================================
@@ -174,7 +173,6 @@ IPP = true
 
 UPnP = true
 
-
 # =============================================================================
 # Globals
 # =============================================================================
@@ -231,7 +229,6 @@ UPnP = true
 # Uses the same filter structure as Target.
 
 # Ignore = []
-
 
 # =============================================================================
 # Database Configuration
@@ -290,7 +287,6 @@ MaxLabels = 1
 # AAAA, ALL, CNAME, PTR, etc.
 
 AllowedQueryTypes = ["A", "AAAA", "ALL"]
-
 
 # =============================================================================
 # LLMNR
@@ -418,7 +414,6 @@ Port = 445
 
 # DnsComputer = "DC01"
 
-
 # =============================================================================
 # SMTP (Simple Mail Transfer Protocol)
 # =============================================================================
@@ -466,7 +461,6 @@ Port = 25
 # TLS = true
 # Cert = "/path/to/cert"
 # Key = "/path/to/key"
-
 
 # =============================================================================
 # NTLM Authentication
@@ -588,7 +582,6 @@ DisableNTLMv2 = false
 [[FTP.Server]]
 Port = 21
 
-
 # =============================================================================
 # Kerberos KDC
 # =============================================================================
@@ -606,12 +599,10 @@ EncType = "aes256_cts_hmac_sha1_96"
 # default configuration
 # ErrorCode = "KDC_ERR_C_PRINCIPAL_UNKNOWN"
 
-
 # =============================================================================
 # LDAP
 # =============================================================================
 [LDAP]
-
 
 # A list of capabilities to support. You can also set this option in each server.
 # These OIDs identify Active Directory-specific features per MS-ADTS §3.1.1.3.3.
@@ -698,7 +689,6 @@ Connectionless = false
 Port = 636
 TLS = true
 
-
 # =============================================================================
 # QUIC
 # =============================================================================
@@ -732,7 +722,6 @@ CertLocality = "San Francisco"
 # Validity period in days for the self-signed certificate.
 CertValidityDays = 365
 
-
 # =============================================================================
 # Proxy
 # =============================================================================
@@ -751,7 +740,6 @@ CertValidityDays = 365
 # Script = { file = "dementor/assets/wpad.dat" }
 
 # Additional proxy configuration options may be introduced in future updates.
-
 
 # =============================================================================
 # HTTP
@@ -829,7 +817,6 @@ Port = 80
 # WPAD = false
 # WebDAV = false
 
-
 # =============================================================================
 # RPC
 # =============================================================================
@@ -857,7 +844,6 @@ ErrorCode = "rpc_s_access_denied"
 
 # Interfaces = [ "/path/to/proto.py", "/path/to/directory/"]
 
-
 # =============================================================================
 # EMP
 # =============================================================================
@@ -876,7 +862,6 @@ TargetPort = 49000
 #   - A dictionary with keys 'start' and 'end'
 
 # TargetPortRange = "45000-49999"
-
 
 # =============================================================================
 # MSSQL
@@ -920,7 +905,6 @@ Version = "9.00.1399.06"
 
 InstanceName = "MSSQLServer"
 
-
 # =============================================================================
 # SSRP
 # =============================================================================
@@ -939,7 +923,6 @@ InstanceName = "MSSQLServer"
 # This can be used to emulate specific server instance behaviors or service identifiers.
 
 # InstanceConfig = ";rpc;DEMENTOR"
-
 
 # =============================================================================
 # POP3
@@ -984,7 +967,6 @@ Port = 110
 # TLS = true
 # Cert = "/path/to/cert"
 # Key = "/path/to/key"
-
 
 # =============================================================================
 # IMAP
@@ -1035,7 +1017,6 @@ Port = 143
 # Cert = "/path/to/cert"
 # Key = "/path/to/key"
 
-
 # =============================================================================
 # MySQL
 # =============================================================================
@@ -1064,7 +1045,6 @@ ServerVersion = "8.0.42"
 # Cert = /path/to/cert"
 # Key = "/path/to/key"
 
-
 # =============================================================================
 # X11
 # =============================================================================
@@ -1078,7 +1058,6 @@ ServerVersion = "8.0.42"
 # Custom message returned to the client after authentication completes.
 
 # ErrorMessage = "Access Denied"
-
 
 # =============================================================================
 # IPP
@@ -1136,7 +1115,6 @@ Port = 631
 
 # RemoteCmdCupsFilter =
 
-
 # =============================================================================
 # SSDP
 # =============================================================================
@@ -1160,7 +1138,6 @@ MaxAge = 1800
 # be a fully qualified SSDP header line without CRLF at the end.
 
 ExtraHeaders = ["BOOTID.UPNP.ORG: 1", "CONFIGID.UPNP.ORG: 1337"]
-
 
 # =============================================================================
 # UPnP
@@ -1194,7 +1171,6 @@ SCPDUri = "/scpd.xml"
 
 PresentationUri = "/present.html"
 
-
 # =============================================================================
 # Logging
 # =============================================================================
@@ -1212,12 +1188,12 @@ Enabled = false
 # file output and only affect the terminal output.
 
 DebugLoggers = [
-    "asyncio",
-    "mail.log",
-    "impacket.smbserver",
-    "impacket",
-    "quic",
-    "pyipp.parser",
+  "asyncio",
+  "mail.log",
+  "impacket.smbserver",
+  "impacket",
+  "quic",
+  "pyipp.parser",
 ]
 
 # Enables/Disables logging timestamps for default terminal output. By default, no
@@ -1229,7 +1205,6 @@ DebugLoggers = [
 # enabled.
 
 # TimestampFmt = "%H:%M:%S"
-
 
 [Log.Stream.Hosts]
 
